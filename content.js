@@ -10,13 +10,35 @@ let isProcessing = false;
 
 const scannedPosts = new Map();
 
-let selectedCommunity = "Lalon";
+let selectedCommunity = "Lalon High";
 
 const COMMUNITY_CONFIGS = {
-  lalon: {
-    communityName: "Lalon",
+  lalon_high: {
+    communityName: "Lalon High",
     description:
-      "We are muslim MPs, who experience Islamophobia daily. Our harm looks like jokes about terrorism, extremism, curry and references to go back home. We value healthy debate, but have a strict no tolerance for discrimination and  .",
+      "We are muslim MPs, who experience Islamophobia daily. Our harm looks like jokes about terrorism, extremism, curry and references to go back home. We value healthy debate, but have a strict no tolerance for discrimination and hate .",
+    selectedProtections: [
+      "Mocking religious practices or beliefs",
+      "Twisting religious texts to attack others",
+      "Stirring up conflict between religions",
+      "Saying one religion is 'replacing' or 'taking over'",
+      "Religious conspiracy theories",
+      "Calling you 'extremist' with no reason",
+      "Claiming you're loyal to other countries",
+      "Attacking you personally for your political views",
+      "Questioning your right to vote",
+      "Encouraging violence because of your politics",
+    ],
+    intensity:
+      "Proactive, strict about all forms of discrimination, even subtle/not overt",
+    selectedConsiderations: [],
+    additionalNeeds: "",
+    agreedToShare: true,
+  },
+  lalon_low: {
+    communityName: "Lalon Low",
+    description:
+      "We are muslim MPs, who experience Islamophobia daily. Our harm looks like jokes about terrorism, extremism, curry and references to go back home. We value healthy debate, but have a strict no tolerance for discrimination and hate .",
     selectedProtections: [
       "Mocking religious practices or beliefs",
       "Twisting religious texts to attack others",
@@ -31,6 +53,18 @@ const COMMUNITY_CONFIGS = {
     ],
     intensity:
       "High tolerance for heated discussions and uncomfortable ideas if civil, but slurs, harassment, and dehumanization not allowed.",
+    selectedConsiderations: [],
+    additionalNeeds: "",
+    agreedToShare: true,
+  },
+
+  leftist: {
+    communityName: "Leftist DAO",
+    description:
+      "Leftist DAO  is a place to discuss the intersection between blockchain and the radical Left.  Here, we're interested in talking to others and discussing different view points.",
+    selectedProtections: [],
+    intensity:
+      "Sensitivity/Strictness: High tolerance for heated discussions and uncomfortable ideas if civil, but slurs, harassment, and dehumanization not allowed",
     selectedConsiderations: [],
     additionalNeeds: "",
     agreedToShare: true,
@@ -86,7 +120,9 @@ function createPanel() {
       <h3>People Powered Moderation</h3>
 
       <select id="community-select">
-        <option value="lalon">Lalon</option>
+        <option value="lalon_high">Lalon High</option>
+        <option value="lalon_low">Lalon Low</option>
+        <option value="leftist">Leftist Dao</option>
         <option value="shespeaks">SheSpeaks</option>
       </select>
 
