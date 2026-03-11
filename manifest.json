@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "WeliveditAi X  Scanner",
+  "version": "1.0",
+  "description": "Scans mentions on X and extracts visible tweets.",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": ["https://x.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*"],
+      "js": ["content.js"]
+    }
+  ]
+}
