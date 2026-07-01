@@ -10,7 +10,7 @@ let isProcessing = false;
 
 const scannedPosts = new Map();
 
-let selectedCommunity = "Lalon High";
+let selectedCommunity = "lalon_high";
 
 const COMMUNITY_CONFIGS = {
   lalon_high: {
@@ -94,6 +94,7 @@ window.addEventListener("load", () => {
 });
 
 function initExtension() {
+  if (document.getElementById("moderation-ball")) return;
   createFloatingButton();
   createPanel();
   injectStyles();
@@ -255,13 +256,17 @@ filter:blur(16px)!important;
 /* New: scanned mark */
 .scanned-mark {
   display:inline-block;
-  width:16px;
-  height:16px;
-  margin-right:6px;
+  width:18px;
+  height:18px;
+  margin:6px;
   background-color:#438951;
   border-radius:50%;
   vertical-align:middle;
-  position:relative;
+  position:absolute;
+  top:4px;
+  right:4px;
+  z-index:2;
+  pointer-events:none;
 }
 
 .scanned-mark::after {
@@ -277,6 +282,34 @@ filter:blur(16px)!important;
   document.head.appendChild(style);
 }
 
+function makeStableId(text) {
+  return String(text || "")
+    .replace(/^✓\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
+
+function isHarmLabel(label) {
+  const value = String(label || "").toLowerCase();
+  return value === "hate_speech" ||
+    value === "harmful" ||
+    value.includes("hate") ||
+    value.includes("dangerous") ||
+    value.includes("derogatory") ||
+    value.includes("exclusionary") ||
+    value.includes("extreme");
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 function extractVisibleContent() {
   const items = [];
 
@@ -289,7 +322,7 @@ function extractVisibleContent() {
     const text = textEl.innerText.trim();
     if (!text) return;
 
-    const id = text.slice(0, 120);
+    const id = makeStableId(text);
 
     items.push({
       id,
@@ -335,13 +368,15 @@ async function processVisibleContent() {
 }
 
 function markScanned(article) {
-  if (article.querySelector(".scanned-mark")) return;
+  if (article.querySelector(":scope > .scanned-mark")) return;
 
   const mark = document.createElement("span");
   mark.className = "scanned-mark";
+  mark.title = "Scanned by Welivedit";
+  mark.setAttribute("aria-hidden", "true");
 
-  const textEl = article.querySelector('[data-testid="tweetText"]');
-  if (textEl) textEl.prepend(mark);
+  article.style.position = article.style.position || "relative";
+  article.prepend(mark);
 }
 
 function applyExistingModeration(item) {
@@ -351,7 +386,7 @@ function applyExistingModeration(item) {
   const textEl = item.element.querySelector('[data-testid="tweetText"]');
   if (!textEl) return;
 
-  if (data.label === "hate_speech") {
+  if (isHarmLabel(data.label)) {
     textEl.classList.add("flagged-text");
 
     if (data.blurred) {
@@ -364,16 +399,40 @@ async function sendBatch(batch) {
   try {
     const messages = batch.map((b) => b.text);
 
+    const payload = {
+      message: messages,
+      community_config: COMMUNITY_CONFIGS[selectedCommunity],
+    };
+
+    if (!payload.community_config) {
+      throw new Error(`Missing community config for ${selectedCommunity}`);
+    }
+
+    if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
+      const proxyResponse = await chrome.runtime.sendMessage({
+        type: "WELIVEDIT_CLASSIFY",
+        url: API_URL,
+        body: payload,
+      });
+
+      if (!proxyResponse?.ok) {
+        console.error("Welivedit API error", proxyResponse);
+        return null;
+      }
+
+      return proxyResponse.data;
+    }
+
     const res = await fetch(API_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        message: messages,
-        community_config: COMMUNITY_CONFIGS[selectedCommunity],
-      }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
     });
+
+    if (!res.ok) {
+      console.error("Welivedit API error", res.status, await res.text());
+      return null;
+    }
 
     return await res.json();
   } catch (err) {
@@ -393,7 +452,8 @@ function handleResults(batch, response) {
 
     scannedPosts.set(item.id, {
       label,
-      blurred: label === "hate_speech",
+      element: item.element,
+      blurred: isHarmLabel(label),
     });
 
     applyExistingModeration(item);
@@ -415,11 +475,11 @@ function addToPanel(id, text) {
   card.id = "card-" + id;
 
   card.innerHTML = `
-<p class="card-text">${text}</p>
+<p class="card-text">${escapeHtml(text)}</p>
 
 <div class="card-footer">
-  <span class="card-label" style="color:${data.label === "hate_speech" ? "red" : "green"}">
-    ${data.label}
+  <span class="card-label" style="color:${isHarmLabel(data.label) ? "red" : "green"}">
+    ${escapeHtml(data.label)}
   </span>
 
   <span class="toggle-icon">👁</span>
@@ -429,10 +489,10 @@ function addToPanel(id, text) {
   const icon = card.querySelector(".toggle-icon");
 
   icon.onclick = () => {
-    const article = findArticleById(id);
-    if (!article) return;
-
     const state = scannedPosts.get(id);
+    const article = state?.element || findArticleById(id);
+    if (!article || !state) return;
+
     state.blurred = !state.blurred;
 
     if (state.blurred) {
@@ -452,7 +512,7 @@ function findArticleById(id) {
     const textEl = article.querySelector('[data-testid="tweetText"]');
     if (!textEl) continue;
 
-    const text = textEl.innerText.trim().slice(0, 120);
+    const text = makeStableId(textEl.innerText.trim());
     if (text === id) return article;
   }
 

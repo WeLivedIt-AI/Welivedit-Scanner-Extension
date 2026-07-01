@@ -1,14 +1,31 @@
 {
-  "manifest_version": 3,
-  "name": "WeliveditAi X  Scanner",
-  "version": "1.0",
-  "description": "Scans mentions on X and extracts visible tweets.",
-  "permissions": ["activeTab", "scripting"],
-  "host_permissions": ["https://x.com/*"],
+  "manifest_version": 2,
+  "name": "WeliveditAi X Scanner",
+  "version": "1.1",
+  "description": "Scans visible posts on X and applies Welivedit moderation labels.",
+  "permissions": [
+    "activeTab",
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://api.welivedit.ai/*",
+    "https://welivedit-service-server-production.up.railway.app/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": false
+  },
   "content_scripts": [
     {
-      "matches": ["https://x.com/*"],
-      "js": ["content.js"]
+      "matches": [
+        "https://x.com/*",
+        "https://twitter.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
     }
   ]
 }
