@@ -223,6 +223,7 @@ box-shadow:0 5px 15px rgba(0,0,0,.1);
 margin-bottom:8px;
 line-height:1.4;
 word-break:break-word;
+color:#333; 
 }
 
 .card-footer{
@@ -292,13 +293,15 @@ function makeStableId(text) {
 
 function isHarmLabel(label) {
   const value = String(label || "").toLowerCase();
-  return value === "hate_speech" ||
+  return (
+    value === "hate_speech" ||
     value === "harmful" ||
     value.includes("hate") ||
     value.includes("dangerous") ||
     value.includes("derogatory") ||
     value.includes("exclusionary") ||
-    value.includes("extreme");
+    value.includes("extreme")
+  );
 }
 
 function escapeHtml(value) {

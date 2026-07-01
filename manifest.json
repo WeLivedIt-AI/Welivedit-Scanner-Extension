@@ -1,20 +1,19 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "name": "WeliveditAi X Scanner",
   "version": "1.1",
   "description": "Scans visible posts on X and applies Welivedit moderation labels.",
   "permissions": [
-    "activeTab",
+    "activeTab"
+  ],
+  "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*",
     "https://api.welivedit.ai/*",
     "https://welivedit-service-server-production.up.railway.app/*"
   ],
   "background": {
-    "scripts": [
-      "background.js"
-    ],
-    "persistent": false
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {
