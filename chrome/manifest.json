@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "WeliveditAi X Scanner",
-  "version": "4.9.0",
-  "description": "Chrome WeLivedIt X helper with optional community account detection/saving and per-reply resolve/analyze.",
+  "version": "5.0.0",
+  "description": "Chrome WeLivedIt X helper with optional community account detection/saving and batched resolve and three concurrent per-reply analyses.",
   "permissions": [
     "storage"
   ],

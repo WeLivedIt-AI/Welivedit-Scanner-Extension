@@ -1,5 +1,5 @@
 
-console.info("[WeLivedIt Chrome v49] content.js loaded", {
+console.info("[WeLivedIt Chrome v50] content.js loaded", {
   href: location.href,
   readyState: document.readyState,
   origin: location.origin,
@@ -9,6 +9,7 @@ window.__weliveditV45Loaded = true;
 window.__weliveditV47Loaded = true;
 window.__weliveditChromeV48Loaded = true;
 window.__weliveditChromeV49Loaded = true;
+window.__weliveditChromeV50Loaded = true;
 
 const DEFAULT_API_BASE_URL = globalThis.WELIVEDIT_CONFIG?.API_BASE_URL || "https://welivedit-ai-servicev2-production.up.railway.app";
 const DEFAULT_AUTH_BASE_URL = globalThis.WELIVEDIT_CONFIG?.AUTH_BASE_URL || "https://welivedit-service-server-production.up.railway.app";
@@ -72,6 +73,7 @@ const state = {
   retrying: new Set(),
   workQueue: [],
   activeWorkers: 0,
+  lastBulkResolveCount: 0,
   coverByKey: new Map(),
   lastPayload: null,
   originalPost: null,
@@ -776,7 +778,10 @@ function renderThreadAccount() {
   saveButton.textContent = account.exists ? "Add account to community" : "Save account to community";
 }
 
-const MAX_CONCURRENT_ITEM_JOBS = 2;
+const MAX_CONCURRENT_ITEM_JOBS = Math.max(1, Number(globalThis.WELIVEDIT_CONFIG?.ITEM_CONCURRENCY || 3));
+const MAX_RESOLVE_BATCH_SIZE = Math.max(1, Number(globalThis.WELIVEDIT_CONFIG?.RESOLVE_BATCH_SIZE || 40));
+const DOM_SCAN_DEBOUNCE_MS = Math.max(100, Number(globalThis.WELIVEDIT_CONFIG?.DOM_SCAN_DEBOUNCE_MS || 300));
+const AUTO_ENQUEUE_DEBOUNCE_MS = Math.max(100, Number(globalThis.WELIVEDIT_CONFIG?.AUTO_ENQUEUE_DEBOUNCE_MS || 180));
 const MAX_SEEN_RECORDS = 2000;
 
 function itemSeenKey(item) {
@@ -868,9 +873,29 @@ function statusDisplay(item) {
   return { text: "detected", className: "" };
 }
 
-function applySingleResponseToItem(item, response) {
-  const serverItem = extractBackendItems(response)[0];
-  if (!serverItem) return item;
+function normalizeBackendIdentity(value) {
+  return String(value || "").trim().replace(/^x:/, "");
+}
+
+function backendItemIdentities(serverItem) {
+  const values = [
+    serverItem?.client_key,
+    serverItem?.clientKey,
+    serverItem?.comment_id,
+    serverItem?.commentId,
+    serverItem?.x_id,
+    serverItem?.xId,
+    serverItem?.source_comment_id,
+    serverItem?.input?.client_key,
+    serverItem?.input?.comment_id,
+    serverItem?.comment?.client_key,
+    serverItem?.comment?.comment_id,
+  ];
+  return [...new Set(values.map(normalizeBackendIdentity).filter(Boolean))];
+}
+
+function applyServerItemToItem(item, serverItem, { render = true } = {}) {
+  if (!item || !serverItem) return item;
   item.comment_db_id = serverItem.comment_db_id || serverItem.commentDbId || item.comment_db_id;
   item.classification_id = serverItem.classification_id || serverItem.classificationId || serverItem.classification?.classification_id || serverItem.classification?.id || item.classification_id;
   item.status = serverItem.status || (isServerItemClassified(serverItem) ? "cached" : "missing");
@@ -889,9 +914,101 @@ function applySingleResponseToItem(item, response) {
       applyHidden(visibleItem.client_key, true, coverLabelForItem(visibleItem));
     }
     updateArticleMark(visibleItem);
-    renderPanel();
+    if (render) renderPanel();
   }
   return visibleItem;
+}
+
+function applySingleResponseToItem(item, response) {
+  const serverItem = extractBackendItems(response)[0];
+  return serverItem ? applyServerItemToItem(item, serverItem) : item;
+}
+
+function applyBatchResponseToItems(items, response) {
+  const serverItems = extractBackendItems(response);
+  const byIdentity = new Map();
+  for (const serverItem of serverItems) {
+    for (const identity of backendItemIdentities(serverItem)) {
+      if (!byIdentity.has(identity)) byIdentity.set(identity, serverItem);
+    }
+  }
+
+  let matched = 0;
+  items.forEach((item, index) => {
+    const identities = [item.client_key, item.comment_id, item.x_id]
+      .map(normalizeBackendIdentity)
+      .filter(Boolean);
+    let serverItem = identities.map((identity) => byIdentity.get(identity)).find(Boolean);
+    if (!serverItem && serverItems.length === items.length) serverItem = serverItems[index];
+    if (!serverItem) return;
+    matched += 1;
+    applyServerItemToItem(item, serverItem, { render: false });
+  });
+  renderPanel();
+  return { matched, total: serverItems.length };
+}
+
+function chunkItems(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+async function resolveItemsInBatches(items) {
+  const pending = items.filter((item) => item && !item.classified && !item.resolveDone && !state.inFlight.has(item.client_key));
+  if (!pending.length) return { attempted: 0, classified: 0, failed: false };
+
+  const generation = state.generation;
+  let classified = 0;
+  let failed = false;
+
+  for (const batch of chunkItems(pending, MAX_RESOLVE_BATCH_SIZE)) {
+    for (const item of batch) {
+      state.inFlight.add(item.client_key);
+      item.status = "resolving";
+      updateArticleMark(item);
+      if (!item.manualRevealed) applyHidden(item.client_key, true, coverLabelForItem(item));
+    }
+    renderPanel();
+
+    try {
+      const response = await apiPost("/api/extension/x-comments/resolve", {
+        ...buildPayload(batch),
+        model: state.model,
+      });
+      if (generation !== state.generation) break;
+
+      applyBatchResponseToItems(batch, response);
+      for (const item of batch) {
+        item.resolveDone = true;
+        if (item.classified) {
+          classified += 1;
+          item.status = String(item.status || "cached").includes("analyzed") ? "analyzed" : "cached";
+          rememberItem(item, { blocked: false, resolve_status: "classified" });
+        } else {
+          item.status = "missing";
+          rememberItem(item, { blocked: false, resolve_status: "missing", classification: null });
+        }
+        updateArticleMark(item);
+      }
+    } catch (error) {
+      failed = true;
+      console.warn("[WeLivedIt] bulk resolve failed; falling back to per-item resolve", error);
+      for (const item of batch) {
+        item.status = "detected";
+        item.lastError = String(error?.message || error);
+        updateArticleMark(item);
+      }
+    } finally {
+      for (const item of batch) state.inFlight.delete(item.client_key);
+      renderPanel();
+    }
+  }
+
+  state.lastBulkResolveCount = pending.length;
+  return { attempted: pending.length, classified, failed };
 }
 
 async function processSingleItem(item, { manual = false } = {}) {
@@ -997,11 +1114,26 @@ async function enqueueUnprocessedItems({ manual = false } = {}) {
   }
   scanVisibleReplies({ render: false, hide: true });
   const items = [...state.items.values()].sort((a, b) => (a.dom_order ?? Number.MAX_SAFE_INTEGER) - (b.dom_order ?? Number.MAX_SAFE_INTEGER));
+  const candidates = items.filter((item) => (
+    !item.classified &&
+    !state.inFlight.has(item.client_key) &&
+    !state.queued.has(item.client_key) &&
+    (!item.autoBlocked || manual)
+  ));
+
+  const resolveSummary = await resolveItemsInBatches(candidates);
+
   let queued = 0;
-  for (const item of items) {
+  for (const item of candidates) {
     if (enqueueItem(item, { manual })) queued += 1;
   }
-  setStatus(queued ? `Queued ${queued} repl${queued === 1 ? "y" : "ies"}. Results appear one by one.` : "No new replies to check.");
+
+  const cached = resolveSummary.classified;
+  if (cached || queued) {
+    setStatus(`${cached ? `${cached} cached · ` : ""}${queued} queued for analysis · up to ${MAX_CONCURRENT_ITEM_JOBS} active.`);
+  } else {
+    setStatus("No new replies to check.");
+  }
   renderPanel();
   return queued;
 }
@@ -1010,7 +1142,7 @@ function scheduleAutoEnqueue() {
   clearTimeout(state.autoEnqueueTimer);
   state.autoEnqueueTimer = window.setTimeout(() => {
     if (state.autoMode) enqueueUnprocessedItems({ manual: false });
-  }, 250);
+  }, AUTO_ENQUEUE_DEBOUNCE_MS);
 }
 
 async function onAutoModeChanged(event) {
@@ -1419,12 +1551,13 @@ function renderPanel() {
   const content = document.getElementById("welivedit-content");
   if (!summary || !content) return;
   const items = [...state.items.values()].sort((a, b) => (a.dom_order ?? Number.MAX_SAFE_INTEGER) - (b.dom_order ?? Number.MAX_SAFE_INTEGER));
-  const processing = items.filter((x) => state.inFlight.has(x.client_key) || state.queued.has(x.client_key)).length;
+  const active = items.filter((x) => state.inFlight.has(x.client_key)).length;
+  const queuedCount = items.filter((x) => state.queued.has(x.client_key)).length;
   const waiting = items.filter((x) => !x.classified && x.status !== "error" && !state.inFlight.has(x.client_key) && !state.queued.has(x.client_key)).length;
   const errors = items.filter((x) => x.status === "error").length;
   const harmful = items.filter((x) => x.classified && isHarmful(x.classification)).length;
   const safe = items.filter((x) => x.classified && !isHarmful(x.classification)).length;
-  summary.textContent = `${items.length} replies · ${safe} safe · ${harmful} hidden · ${processing} checking${errors ? ` · ${errors} failed` : ""}${waiting ? ` · ${waiting} waiting` : ""}`;
+  summary.textContent = `${items.length} replies · ${safe} safe · ${harmful} hidden · ${active} active · ${queuedCount} queued${errors ? ` · ${errors} failed` : ""}${waiting ? ` · ${waiting} waiting` : ""}`;
   content.innerHTML = "";
 
   if (!items.length) {
@@ -1572,7 +1705,7 @@ function startThreadObserver() {
       revealOnlyWhenAllVisibleClassified();
       renderPanel();
       if (state.autoMode) scheduleAutoEnqueue();
-    }, 650);
+    }, DOM_SCAN_DEBOUNCE_MS);
   });
   observer.observe(document.body, { childList: true, subtree: true });
 }
