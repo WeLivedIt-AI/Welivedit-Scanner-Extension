@@ -3,7 +3,7 @@
 ## Active services
 
 - AI resolve/analyze: `https://welivedit-ai-servicev2-production.up.railway.app`
-- Authentication: `https://welivedit-service-server-production.up.railway.app`
+- Authentication: `https://welivedit-service-server-production-7991.up.railway.app`
 
 Both `/api/extension/x-comments/resolve` and `/api/extension/x-comments/analyze` are built from `state.apiBaseUrl`, which defaults to the Railway AI endpoint above.
 

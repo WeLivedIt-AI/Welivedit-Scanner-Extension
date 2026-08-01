@@ -127,7 +127,7 @@ async function handleAuthStatus() {
 }
 
 async function handleAuthLogin(payload = {}) {
-  const authBaseUrl = normalizeBaseUrl(payload.authBaseUrl || payload.apiBaseUrl || DEFAULT_AUTH_BASE_URL);
+  const authBaseUrl = DEFAULT_AUTH_BASE_URL;
   const email = String(payload.email || "").trim();
   const password = String(payload.password || "");
 

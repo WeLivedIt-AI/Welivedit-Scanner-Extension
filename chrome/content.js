@@ -188,7 +188,8 @@ async function loadSettings() {
   const shouldMigrateApiUrl = !storedApiBaseUrl || LEGACY_API_BASE_URLS.has(storedApiBaseUrl);
 
   state.apiBaseUrl = shouldMigrateApiUrl ? DEFAULT_API_BASE_URL : storedApiBaseUrl;
-  state.authBaseUrl = normalizeBaseUrl(values[STORAGE_KEYS.authBaseUrl] || DEFAULT_AUTH_BASE_URL);
+  const storedAuthBaseUrl = normalizeBaseUrl(values[STORAGE_KEYS.authBaseUrl] || "");
+  state.authBaseUrl = DEFAULT_AUTH_BASE_URL;
   state.communityId = String(values[STORAGE_KEYS.communityId] || DEFAULT_COMMUNITY_ID);
   state.model = String(values[STORAGE_KEYS.model] || DEFAULT_MODEL);
   state.authEnabled = DEFAULT_AUTH_ENABLED;
@@ -199,6 +200,11 @@ async function loadSettings() {
   if (shouldMigrateApiUrl && storedApiBaseUrl !== DEFAULT_API_BASE_URL) {
     await storageSet({ [STORAGE_KEYS.apiBaseUrl]: DEFAULT_API_BASE_URL });
     console.info("[WeLivedIt] migrated AI API base URL", { from: storedApiBaseUrl || null, to: DEFAULT_API_BASE_URL });
+  }
+
+  if (storedAuthBaseUrl !== DEFAULT_AUTH_BASE_URL) {
+    await storageSet({ [STORAGE_KEYS.authBaseUrl]: DEFAULT_AUTH_BASE_URL });
+    console.info("[WeLivedIt] migrated authentication base URL", { from: storedAuthBaseUrl || null, to: DEFAULT_AUTH_BASE_URL });
   }
 }
 
