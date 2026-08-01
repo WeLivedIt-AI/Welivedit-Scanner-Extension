@@ -1,6 +1,6 @@
 importScripts("config.js");
 
-const DEFAULT_AUTH_BASE_URL = globalThis.WELIVEDIT_CONFIG?.AUTH_BASE_URL || "https://welivedit-service-server-production.up.railway.app";
+const DEFAULT_AUTH_BASE_URL = globalThis.WELIVEDIT_CONFIG?.AUTH_BASE_URL || "https://welivedit-service-server-production-7991.up.railway.app";
 
 const STORAGE_KEYS = {
   authToken: "welivedit_auth_token",

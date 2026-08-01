@@ -10,7 +10,7 @@ window.__weliveditV49Loaded = true;
 window.__weliveditV50Loaded = true;
 
 const DEFAULT_API_BASE_URL = globalThis.WELIVEDIT_CONFIG?.API_BASE_URL || "https://welivedit-ai-servicev2-production.up.railway.app";
-const DEFAULT_AUTH_BASE_URL = globalThis.WELIVEDIT_CONFIG?.AUTH_BASE_URL || "https://welivedit-service-server-production.up.railway.app";
+const DEFAULT_AUTH_BASE_URL = globalThis.WELIVEDIT_CONFIG?.AUTH_BASE_URL || "https://welivedit-service-server-production-7991.up.railway.app";
 const DEFAULT_COMMUNITY_ID = globalThis.WELIVEDIT_CONFIG?.COMMUNITY_ID || "SAW_v1";
 const DEFAULT_MODEL = globalThis.WELIVEDIT_CONFIG?.MODEL || "gpt-4.1-nano";
 const DEFAULT_AUTH_ENABLED = true;
