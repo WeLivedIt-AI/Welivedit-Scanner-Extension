@@ -1,14 +1,14 @@
 {
   "manifest_version": 2,
   "name": "WeliveditAi X Scanner",
-  "version": "5.0",
-  "description": "Firefox WeLivedIt X helper with optional community account detection/saving and batched resolve and three concurrent per-reply analyses.",
+  "version": "5.0.1",
+  "description": "Firefox WeLivedIt X helper with optional community account detection/saving and batched resolve and three concurrent per-reply analyses. Authentication is pinned to the Railway 7991 service.",
   "permissions": [
     "storage",
     "https://x.com/*",
     "https://twitter.com/*",
     "https://welivedit-ai-servicev2-production.up.railway.app/*",
-    "https://welivedit-service-server-production.up.railway.app/*",
+    "https://welivedit-service-server-production-7991.up.railway.app/*",
     "http://localhost/*",
     "http://127.0.0.1/*"
   ],
