@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "WeliveditAi X Scanner",
-  "version": "5.0.1",
-  "description": "Chrome WeLivedIt X helper with optional community account detection/saving and batched resolve and three concurrent per-reply analyses. Authentication is pinned to the Railway 7991 service.",
+  "version": "5.0.2",
+  "description": "WeLivedIt X helper. Sends the selected community_id and original-post account_id at request, post, and comment level for reliable database storage.",
   "permissions": [
     "storage"
   ],
