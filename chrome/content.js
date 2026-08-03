@@ -64,6 +64,7 @@ const state = {
   },
   threadAccountLookupKey: null,
   threadAccountLookupTimer: null,
+  threadAccountLookupPromise: null,
   classifierConfig: null,
   classifierCacheKey: null,
   items: new Map(),
@@ -568,12 +569,21 @@ function scanVisibleReplies({ render = true, hide = true } = {}) {
   return replies;
 }
 
+function getSelectedThreadContext() {
+  return {
+    communityId: state.communityId || null,
+    accountId: state.threadAccount?.accountId || null,
+  };
+}
+
 function buildPayload(items, originalOverride = null) {
   const { original } = getThreadArticles();
   const originalPost = originalOverride || state.originalPost || original;
   const orderedItems = [...items].sort((a, b) => (a.dom_order ?? Number.MAX_SAFE_INTEGER) - (b.dom_order ?? Number.MAX_SAFE_INTEGER));
+  const selectedContext = getSelectedThreadContext();
   return {
-    community_id: state.communityId,
+    community_id: selectedContext.communityId,
+    account_id: selectedContext.accountId,
     platform: "x",
     ...SOURCE_META,
     ingestion_method: state.autoMode ? "automatic_extension_item_detection" : "manual_extension_item_send",
@@ -586,7 +596,8 @@ function buildPayload(items, originalOverride = null) {
       message: originalPost.message,
       author_username: originalPost.author_username,
       author_name: originalPost.author_name || originalPost.author_username,
-      account_id: state.threadAccount?.linkedToCommunity ? state.threadAccount.accountId : null,
+      account_id: selectedContext.accountId,
+      community_id: selectedContext.communityId,
       url: originalPost.url,
     } : null,
     comments: orderedItems.map((item) => ({
@@ -596,6 +607,8 @@ function buildPayload(items, originalOverride = null) {
       message: item.message,
       author_username: item.author_username,
       author_name: item.author_name || item.author_username,
+      account_id: selectedContext.accountId,
+      community_id: selectedContext.communityId,
       url: item.url,
       ...SOURCE_META,
     })),
@@ -670,8 +683,9 @@ async function refreshThreadAccount(originalOverride = null, { force = false } =
   if (!payload) return null;
 
   const lookupKey = `${state.apiBaseUrl}|${state.communityId}|x|${String(payload.username).toLowerCase()}`;
-  if (!force && state.threadAccountLookupKey === lookupKey && !state.threadAccount.error) {
-    return state.threadAccount;
+  if (!force && state.threadAccountLookupKey === lookupKey) {
+    if (state.threadAccountLookupPromise) return state.threadAccountLookupPromise;
+    if (!state.threadAccount.error && !state.threadAccount.loading) return state.threadAccount;
   }
 
   state.threadAccountLookupKey = lookupKey;
@@ -693,19 +707,50 @@ async function refreshThreadAccount(originalOverride = null, { force = false } =
   });
   renderThreadAccount();
 
-  try {
-    const response = await apiPost("/api/extension/accounts/resolve", payload);
-    applyThreadAccountResponse(response, original);
-  } catch (error) {
-    state.threadAccount = emptyThreadAccount({
-      username: payload.username,
-      accountName: payload.account_name,
-      status: "error",
-      error: String(error?.message || error),
-    });
-    renderThreadAccount();
+  const lookupPromise = (async () => {
+    try {
+      const response = await apiPost("/api/extension/accounts/resolve", payload);
+      applyThreadAccountResponse(response, original);
+    } catch (error) {
+      state.threadAccount = emptyThreadAccount({
+        username: payload.username,
+        accountName: payload.account_name,
+        status: "error",
+        error: String(error?.message || error),
+      });
+      renderThreadAccount();
+    } finally {
+      state.threadAccountLookupPromise = null;
+    }
+    return state.threadAccount;
+  })();
+
+  state.threadAccountLookupPromise = lookupPromise;
+  return lookupPromise;
+}
+
+async function ensureThreadContextReady() {
+  if (!state.communityId) {
+    setStatus("No community is selected.");
+    return false;
   }
-  return state.threadAccount;
+
+  const original = state.originalPost || getThreadArticles().original;
+  if (!original?.author_username) {
+    setStatus("Open an X post so the original account can be identified.");
+    return false;
+  }
+
+  state.originalPost = original;
+  const account = await refreshThreadAccount(original);
+  if (!account?.accountId) {
+    const detail = account?.error ? ` ${account.error}` : "";
+    setStatus(`The original post account has not been identified yet.${detail}`);
+    renderPanel();
+    return false;
+  }
+
+  return true;
 }
 
 async function saveThreadAccount() {
@@ -1119,6 +1164,7 @@ async function enqueueUnprocessedItems({ manual = false } = {}) {
     return 0;
   }
   scanVisibleReplies({ render: false, hide: true });
+  if (!(await ensureThreadContextReady())) return 0;
   const items = [...state.items.values()].sort((a, b) => (a.dom_order ?? Number.MAX_SAFE_INTEGER) - (b.dom_order ?? Number.MAX_SAFE_INTEGER));
   const candidates = items.filter((item) => (
     !item.classified &&
@@ -1173,6 +1219,11 @@ async function retryItem(clientKey) {
   try {
     if (!(await ensureAuthIfNeeded())) {
       state.pendingManualSend = true;
+      state.retrying.delete(clientKey);
+      renderPanel();
+      return;
+    }
+    if (!(await ensureThreadContextReady())) {
       state.retrying.delete(clientKey);
       renderPanel();
       return;
@@ -1246,6 +1297,8 @@ function debugSnapshot() {
     url: location.href,
     apiBaseUrl: state.apiBaseUrl,
     communityId: state.communityId,
+    accountId: state.threadAccount?.accountId || null,
+    accountLinkedToCommunity: Boolean(state.threadAccount?.linkedToCommunity),
     model: state.model,
     classifierCacheKey: state.classifierCacheKey,
     classifierConfig: state.classifierConfig,
@@ -1294,6 +1347,8 @@ async function apiPost(path, body) {
     path,
     url,
     bodyComments: Array.isArray(body?.comments) ? body.comments.length : null,
+    communityId: body?.community_id || null,
+    accountId: body?.account_id || null,
   });
 
   const proxyResponse = await runtimeMessage({
@@ -1642,6 +1697,7 @@ function resetThreadStateForNavigation(reason = "navigation") {
   clearTimeout(state.threadAccountLookupTimer);
   state.threadAccountLookupTimer = null;
   state.threadAccountLookupKey = null;
+  state.threadAccountLookupPromise = null;
   state.threadAccount = emptyThreadAccount();
   state.currentPageKey = pageKey();
   setStatus("New X page detected.");
