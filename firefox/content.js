@@ -1,5 +1,5 @@
 
-console.info("[WeLivedIt v50] content.js loaded", {
+console.info("[WeLivedIt Firefox v5.1.3] content.js loaded", {
   href: location.href,
   readyState: document.readyState,
   origin: location.origin,
@@ -8,12 +8,26 @@ console.info("[WeLivedIt v50] content.js loaded", {
 window.__weliveditV45Loaded = true;
 window.__weliveditV49Loaded = true;
 window.__weliveditV50Loaded = true;
+window.__weliveditFirefoxV504Loaded = true;
+window.__weliveditFirefoxV511Loaded = true;
+window.__weliveditFirefoxV512Loaded = true;
+window.__weliveditFirefoxV513Loaded = true;
 
 const DEFAULT_API_BASE_URL = globalThis.WELIVEDIT_CONFIG?.API_BASE_URL || "https://welivedit-ai-servicev2-production.up.railway.app";
 const DEFAULT_AUTH_BASE_URL = globalThis.WELIVEDIT_CONFIG?.AUTH_BASE_URL || "https://welivedit-service-server-production-7991.up.railway.app";
 const DEFAULT_COMMUNITY_ID = globalThis.WELIVEDIT_CONFIG?.COMMUNITY_ID || "SAW_v1";
 const DEFAULT_MODEL = globalThis.WELIVEDIT_CONFIG?.MODEL || "gpt-4.1-nano";
 const DEFAULT_AUTH_ENABLED = true;
+const COMMENT_CLIMATE_CONFIG = (() => {
+  const raw = globalThis.WELIVEDIT_CONFIG?.COMMENT_CLIMATE || {};
+  const happy = clampPercent(raw.HAPPY_MIN_SAFE_PERCENT, 70);
+  const veryHappy = Math.max(happy, clampPercent(raw.VERY_HAPPY_MIN_SAFE_PERCENT, 90));
+  return Object.freeze({
+    happyMinSafePercent: happy,
+    veryHappyMinSafePercent: veryHappy,
+    forceNeutralWhenDangerous: raw.FORCE_NEUTRAL_WHEN_DANGEROUS !== false,
+  });
+})();
 const SEEN_CACHE_NAMESPACE = "welivedit-extension:v45";
 const LEGACY_API_BASE_URLS = new Set([
   "http://localhost",
@@ -49,7 +63,12 @@ const state = {
   authEnabled: DEFAULT_AUTH_ENABLED,
   autoMode: false,
   authStatus: { authenticated: false, email: null },
+  // Identity of the person using WeLivedIt. This is authentication context only.
+  // It must never be used as the target account for comments.
+  viewerIdentity: { userId: null, linkedAccounts: [] },
+  // The monitored X account that owns the original post in the current /status/:id URL.
   threadAccount: {
+    postId: null,
     username: null,
     accountName: null,
     accountId: null,
@@ -75,13 +94,18 @@ const state = {
   coverByKey: new Map(),
   lastPayload: null,
   originalPost: null,
+  // Immutable identity of the original /status/:id owner for the current thread.
+  // Once set, scrolling or DOM recycling must never replace it with a reply author.
+  threadOwnerLock: null,
   seenRecords: {},
   seenPersistTimer: null,
   autoEnqueueTimer: null,
   pendingManualSend: false,
   generation: 0,
-  currentPageKey: location.href,
+  currentPageKey: locationThreadStatusId() ? `${location.hostname}|status:${locationThreadStatusId()}` : `${location.hostname}${location.pathname}`,
   navigationResetTimer: null,
+  explicitNavigationStatusId: null,
+  explicitNavigationAt: 0,
   debugEvents: [],
   lastApiResponses: [],
 };
@@ -308,6 +332,10 @@ function createPanel() {
     <button id="welivedit-send" class="welivedit-main-action">Send replies to community</button>
 
     <div id="welivedit-status" class="welivedit-status">Ready.</div>
+    <section id="welivedit-climate" class="welivedit-climate" aria-live="polite">
+      <div class="welivedit-climate-title">Comment climate</div>
+      <div class="welivedit-climate-empty">Waiting for checked replies.</div>
+    </section>
     <div id="welivedit-summary" class="welivedit-summary"></div>
     <div id="welivedit-content"></div>
   `;
@@ -340,10 +368,11 @@ function injectStyles() {
 #welivedit-panel.open{right:0}.welivedit-header{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.welivedit-header h3{margin:0 0 3px;font-size:17px}.welivedit-muted{margin:0 0 8px;font-size:11px;color:#53606a;line-height:1.3}#welivedit-close{border:0!important;background:transparent!important;color:#26333f!important;font-size:25px!important;padding:0 3px!important;cursor:pointer}
 #welivedit-panel input{box-sizing:border-box;padding:7px;border-radius:7px;border:1px solid #c8d4cc}.welivedit-auth-box{background:rgba(255,255,255,.72);border:1px solid #d8e2db;border-radius:10px;padding:8px;margin-top:4px}.welivedit-auth-current{font-size:11px;color:#43505a}.welivedit-auth-current.ok{color:#155b31;font-weight:700}.welivedit-auth-current.warn{color:#a31313;font-weight:700}.welivedit-auth-form{display:grid;grid-template-columns:1fr 1fr auto;gap:5px;margin-top:6px}.welivedit-auth-form input{min-width:0;width:100%;font-size:11px}.welivedit-auth-form button{white-space:nowrap;padding:7px!important;font-size:11px!important}.welivedit-auth-logged-in{margin-top:3px}.welivedit-auth-logged-in summary{cursor:pointer;font-size:10px;color:#53606a;list-style-position:inside}.welivedit-auth-logged-in button{width:100%;margin-top:5px;padding:6px!important;font-size:10px!important}
 .welivedit-account-box{background:rgba(255,255,255,.82);border:1px solid #d8e2db;border-radius:10px;padding:9px 10px;margin-top:8px}.welivedit-account-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;color:#53606a}.welivedit-account-head strong{color:#26333f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.welivedit-account-status{font-size:10px;line-height:1.35;color:#65727d;margin-top:4px}.welivedit-account-status.ok{color:#155b31;font-weight:700}.welivedit-account-status.warn{color:#8a5b00}.welivedit-account-status.error{color:#a31313}.welivedit-account-box button{width:100%;margin-top:7px;padding:7px!important;font-size:10px!important}
-.welivedit-auto-row{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#fff;border:1px solid #d8e2db;border-radius:10px;padding:9px 10px;margin-top:9px}.welivedit-auto-row span{display:flex;flex-direction:column;gap:2px;font-size:12px}.welivedit-auto-row small{font-size:10px;color:#65727d;font-weight:400}.welivedit-auto-row input{width:18px!important;height:18px;margin:0;cursor:pointer}.welivedit-main-action{width:100%;margin:8px 0 7px;padding:9px!important;font-size:12px!important}.welivedit-secondary-action{background:#6b7884!important}
+.welivedit-auto-row{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#fff;border:1px solid #d8e2db;border-radius:10px;padding:9px 10px;margin-top:9px}.welivedit-auto-row span{display:flex;flex-direction:column;gap:2px;font-size:12px}.welivedit-auto-row small{font-size:10px;color:#65727d;font-weight:400}.welivedit-auto-row input{width:18px!important;height:18px;margin:0;cursor:pointer}.welivedit-auto-row.is-disabled{opacity:.62}.welivedit-auto-row.is-disabled input{cursor:not-allowed}.welivedit-main-action{width:100%;margin:8px 0 7px;padding:9px!important;font-size:12px!important}.welivedit-secondary-action{background:#6b7884!important}
+.welivedit-climate{background:rgba(255,255,255,.84);border:1px solid #d8e2db;border-radius:10px;padding:9px 10px;margin:0 0 7px}.welivedit-climate-title{font-size:10px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#53606a;margin-bottom:6px}.welivedit-climate-grid{display:grid;grid-template-columns:1fr auto;gap:5px 10px;align-items:center}.welivedit-climate-label{font-size:10px;color:#65727d}.welivedit-climate-result{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-width:126px}.welivedit-climate-emoji{font-size:22px;line-height:1}.welivedit-climate-value{font-size:11px;font-weight:800;color:#26333f;text-align:right}.welivedit-climate-value small{display:block;font-size:9px;font-weight:500;color:#65727d;margin-top:1px}.welivedit-climate-impact{font-size:10px;color:#155b31;font-weight:700;margin-top:7px}.welivedit-climate-note{font-size:9px;color:#65727d;margin-top:5px;line-height:1.3}.welivedit-climate-empty{font-size:10px;color:#65727d}
 #welivedit-panel button,.welivedit-card button{border:0;border-radius:8px;background:#438951;color:#fff;cursor:pointer;font-weight:700}#welivedit-panel button:hover,.welivedit-card button:hover{filter:brightness(.95)}.welivedit-status{font-size:11px;padding:6px 8px;background:rgba(255,255,255,.72);border-radius:8px;border:1px solid #d8e2db;margin-bottom:6px}.welivedit-summary{font-size:11px;color:#43505a;margin-bottom:7px}#welivedit-content{overflow-y:auto;padding-right:3px;min-height:0}.welivedit-card{background:#fff;border-radius:10px;padding:9px;margin-bottom:7px;box-shadow:0 3px 10px rgba(0,0,0,.06);border:1px solid #e3ece6}.welivedit-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:5px}.welivedit-card-author{font-size:11px;font-weight:700;color:#26333f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.welivedit-card-text{font-size:12px;line-height:1.35;max-height:68px;overflow:auto;margin-bottom:6px;color:#26333f}.welivedit-card-placeholder{font-size:11px;line-height:1.35;color:#65727d;margin-bottom:6px}.welivedit-card-meta{display:flex;flex-wrap:wrap;gap:5px;align-items:center}.welivedit-badge{display:inline-block;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:700;background:#eef2f7;color:#293744}.welivedit-badge.processing{background:#fff2cc;color:#745500}.welivedit-badge.harmful{background:#ffe2e2;color:#a31313}.welivedit-badge.supportive,.welivedit-badge.safe{background:#def7e7;color:#155b31}.welivedit-badge.error{background:#f6dfe3;color:#9c1c31}.welivedit-card-actions{display:flex;justify-content:flex-end;gap:5px;margin-top:6px}.welivedit-card-actions button{font-size:10px;padding:5px 7px}
 .welivedit-mark{position:absolute;top:4px;right:4px;z-index:2147483646;background:#65727d;color:#fff;font:700 10px Arial;border-radius:999px;padding:3px 6px;pointer-events:none;min-width:14px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.22)}.welivedit-mark.is-processing{background:#c58b00}.welivedit-mark.is-safe{background:#238846}.welivedit-mark.is-harmful{background:#ba2b3c}.welivedit-mark.is-error{background:#7a3340}.welivedit-mark.is-cached{background:#28758f}
-.welivedit-cover{display:none;position:absolute!important;inset:0!important;width:auto!important;height:auto!important;z-index:2147483645!important;box-sizing:border-box!important;margin:0!important;padding:10px 12px!important;border-radius:12px!important;background:#e8f5eb!important;color:#183925!important;border:1px solid #b8d8c1!important;font:700 12px Arial,sans-serif!important;align-items:center!important;justify-content:center!important;flex-direction:column!important;text-align:center!important;box-shadow:0 4px 18px rgba(0,0,0,.10)!important;pointer-events:auto!important;overflow:hidden!important}.welivedit-cover.is-visible{display:flex!important}.welivedit-cover button{margin-top:6px;background:#438951!important;color:#fff!important;border:0!important;border-radius:8px!important;padding:5px 9px!important;font:700 11px Arial!important;cursor:pointer!important;pointer-events:auto!important}.welivedit-hard-hidden{position:relative!important}.welivedit-redacted-shell{visibility:hidden!important;opacity:0!important;filter:none!important;pointer-events:none!important;user-select:none!important;-webkit-user-select:none!important}.welivedit-redacted-shell *{visibility:hidden!important;opacity:0!important;filter:none!important;pointer-events:none!important;user-select:none!important;-webkit-user-select:none!important}.welivedit-empty{font-size:11px;line-height:1.4;color:#53606a;background:rgba(255,255,255,.55);padding:9px;border-radius:9px}
+.welivedit-cover{display:none;position:absolute!important;inset:0!important;width:auto!important;height:auto!important;z-index:2147483645!important;box-sizing:border-box!important;margin:0!important;padding:10px 12px!important;border-radius:12px!important;background:#e8f5eb!important;color:#183925!important;border:1px solid #b8d8c1!important;font:700 12px Arial,sans-serif!important;align-items:center!important;justify-content:center!important;flex-direction:column!important;text-align:center!important;box-shadow:0 4px 18px rgba(0,0,0,.10)!important;pointer-events:auto!important;overflow:hidden!important}.welivedit-cover.is-visible{display:flex!important}.welivedit-cover.is-rehide{display:flex!important;inset:auto 8px 8px auto!important;width:auto!important;height:auto!important;padding:0!important;background:transparent!important;border:0!important;box-shadow:none!important;align-items:center!important;justify-content:center!important;overflow:visible!important}.welivedit-cover.is-rehide button{margin:0!important;background:#17212b!important;box-shadow:0 3px 10px rgba(0,0,0,.24)!important}.welivedit-cover button{margin-top:6px;background:#438951!important;color:#fff!important;border:0!important;border-radius:8px!important;padding:5px 9px!important;font:700 11px Arial!important;cursor:pointer!important;pointer-events:auto!important}.welivedit-hard-hidden{position:relative!important}.welivedit-redacted-shell{visibility:hidden!important;opacity:0!important;filter:none!important;pointer-events:none!important;user-select:none!important;-webkit-user-select:none!important}.welivedit-redacted-shell *{visibility:hidden!important;opacity:0!important;filter:none!important;pointer-events:none!important;user-select:none!important;-webkit-user-select:none!important}.welivedit-empty{font-size:11px;line-height:1.4;color:#53606a;background:rgba(255,255,255,.55);padding:9px;border-radius:9px}.welivedit-focus-highlight{outline:4px solid #438951!important;outline-offset:4px!important;border-radius:12px!important;animation:welivedit-focus-pulse .7s ease-in-out 3!important}@keyframes welivedit-focus-pulse{0%,100%{outline-width:4px;box-shadow:0 0 0 0 rgba(67,137,81,.15)}50%{outline-width:6px;box-shadow:0 0 0 10px rgba(67,137,81,.12)}}
 @media (max-width:480px){#welivedit-panel{width:100vw;padding:11px}#welivedit-ball{right:9px;width:49px;height:49px}.welivedit-auth-form{grid-template-columns:1fr}.welivedit-auth-form button{width:100%}}
   `;
   document.head.appendChild(style);
@@ -367,6 +396,12 @@ async function refreshAuthStatus(updatePanel = true) {
   state.authStatus = response?.ok
     ? { authenticated: Boolean(response.authenticated), email: response.email || null }
     : { authenticated: false, email: null };
+  state.viewerIdentity = response?.ok
+    ? {
+        userId: response.viewer?.userId || null,
+        linkedAccounts: Array.isArray(response.viewer?.linkedAccounts) ? response.viewer.linkedAccounts : [],
+      }
+    : { userId: null, linkedAccounts: [] };
   updateAuthUi();
   if (state.authStatus.authenticated && state.originalPost?.author_username) {
     scheduleThreadAccountRefresh(state.originalPost);
@@ -410,6 +445,7 @@ function updateAuthUi() {
       signedEl.open = false;
     }
   }
+  updateSendPermissionsUi();
 }
 
 async function loginFromPanel() {
@@ -431,6 +467,10 @@ async function loginFromPanel() {
   const passwordInput = document.getElementById("welivedit-auth-password");
   if (passwordInput) passwordInput.value = "";
   state.authStatus = { authenticated: true, email: response.email || email };
+  state.viewerIdentity = {
+    userId: response.viewer?.userId || null,
+    linkedAccounts: Array.isArray(response.viewer?.linkedAccounts) ? response.viewer.linkedAccounts : [],
+  };
   updateAuthUi();
   await refreshClassifierConfig();
   scheduleThreadAccountRefresh(state.originalPost, { force: true });
@@ -445,6 +485,7 @@ async function loginFromPanel() {
 async function logoutFromPanel() {
   const response = await runtimeMessage({ type: "WELIVEDIT_AUTH_LOGOUT" });
   state.authStatus = { authenticated: false, email: null };
+  state.viewerIdentity = { userId: null, linkedAccounts: [] };
   updateAuthUi();
   setStatus(response?.ok ? "Signed out." : "Sign-out failed.");
 }
@@ -459,14 +500,214 @@ async function ensureAuthIfNeeded() {
   return false;
 }
 
-function currentThreadStatusId() {
+function normalizeAccountId(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function viewerLinkedAccountForThread() {
+  const targetAccountId = normalizeAccountId(state.threadAccount?.accountId);
+  if (!targetAccountId) return null;
+  return (state.viewerIdentity?.linkedAccounts || []).find((account) => (
+    normalizeAccountId(account?.accountId) === targetAccountId &&
+    (!account?.platform || String(account.platform).toLowerCase() === "x")
+  )) || null;
+}
+
+function getThreadSendPermission() {
+  if (!state.authStatus.authenticated) {
+    return { allowed: false, canPromptLogin: true, reason: "Sign in to verify that this is your own X post." };
+  }
+  if (state.threadAccount?.loading) {
+    return { allowed: false, reason: "Checking who owns the original post…" };
+  }
+  if (!state.threadAccount?.accountId) {
+    return { allowed: false, reason: "The original post account has not been identified yet." };
+  }
+  if (!state.threadAccount?.linkedToCommunity) {
+    return { allowed: false, reason: "This post owner is not configured in the selected community." };
+  }
+  const viewerAccount = viewerLinkedAccountForThread();
+  if (!viewerAccount) {
+    return {
+      allowed: false,
+      reason: "You can send replies only from posts owned by one of your linked X accounts.",
+    };
+  }
+  return { allowed: true, viewerAccount };
+}
+
+function updateSendPermissionsUi() {
+  const sendButton = document.getElementById("welivedit-send");
+  const autoInput = document.getElementById("welivedit-auto-mode");
+  const autoRow = autoInput?.closest?.(".welivedit-auto-row") || null;
+  const permission = getThreadSendPermission();
+
+  if (sendButton) {
+    if (!state.authStatus.authenticated) {
+      sendButton.disabled = false;
+      sendButton.textContent = "Sign in to send replies";
+      sendButton.title = "Sign in first; ownership will be checked before anything is sent.";
+    } else if (permission.allowed) {
+      sendButton.disabled = false;
+      sendButton.textContent = "Send replies to community";
+      sendButton.title = "This original post belongs to your linked X account.";
+    } else {
+      sendButton.disabled = true;
+      sendButton.textContent = "Only your own posts can be sent";
+      sendButton.title = permission.reason;
+    }
+  }
+
+  if (autoInput) {
+    const ownershipKnownAndDenied = Boolean(
+      state.authStatus.authenticated &&
+      state.threadAccount?.accountId &&
+      !permission.allowed
+    );
+    autoInput.disabled = ownershipKnownAndDenied;
+    autoInput.checked = ownershipKnownAndDenied ? false : Boolean(state.autoMode);
+    autoInput.title = ownershipKnownAndDenied ? permission.reason : "";
+    autoRow?.classList.toggle("is-disabled", ownershipKnownAndDenied);
+  }
+}
+
+function ensureViewerOwnsCurrentPost() {
+  const permission = getThreadSendPermission();
+  if (permission.allowed) return true;
+  setStatus(permission.reason);
+  document.getElementById("welivedit-panel")?.classList.add("open");
+  updateSendPermissionsUi();
+  return false;
+}
+
+function locationThreadStatusId() {
   const match = location.pathname.match(/\/status\/(\d+)/);
   return match ? match[1] : null;
+}
+
+function explicitNavigationTargets(statusId) {
+  return Boolean(
+    statusId &&
+    state.explicitNavigationStatusId === statusId &&
+    Date.now() - state.explicitNavigationAt < 2500
+  );
+}
+
+function currentThreadStatusId() {
+  const locationStatusId = locationThreadStatusId();
+  const lockedStatusId = state.threadOwnerLock?.threadStatusId || null;
+
+  // Some X DOM/history updates can move the URL to a visible reply while the
+  // user is only scrolling. Keep the initially pinned thread unless a real
+  // user navigation targeted the new status.
+  if (
+    lockedStatusId &&
+    locationStatusId &&
+    locationStatusId !== lockedStatusId &&
+    !explicitNavigationTargets(locationStatusId)
+  ) {
+    return lockedStatusId;
+  }
+  return locationStatusId;
 }
 
 function extractStatusIdFromHref(href) {
   const match = String(href || "").match(/\/status\/(\d+)/);
   return match ? match[1] : null;
+}
+
+function normalizedUsername(value) {
+  return String(value || "").trim().replace(/^@/, "").toLowerCase();
+}
+
+function canonicalStatusAnchor(article) {
+  // The permalink around <time> belongs to the article itself. Arbitrary
+  // /status/ links may point to quoted posts, media, parents, or cards.
+  const timeAnchor = article?.querySelector?.("time")?.closest?.('a[href*="/status/"]');
+  if (timeAnchor && extractStatusIdFromHref(timeAnchor.getAttribute("href") || timeAnchor.href)) {
+    return timeAnchor;
+  }
+
+  const candidates = [...(article?.querySelectorAll?.('a[href*="/status/"]') || [])];
+  return candidates.find((anchor) => {
+    const href = anchor.getAttribute("href") || anchor.href || "";
+    try {
+      const pathname = new URL(href, location.origin).pathname.replace(/\/$/, "");
+      return /^\/[^/]+\/status\/\d+$/.test(pathname);
+    } catch (_) {
+      return /^\/?[^/?#]+\/status\/\d+$/.test(String(href).split(/[?#]/)[0].replace(/\/$/, ""));
+    }
+  }) || null;
+}
+
+function articleAuthorUsername(article, canonicalHref, cachedUsername = null) {
+  const userNameRoot = article?.querySelector?.('[data-testid="User-Name"]');
+  const profileAnchor = [...(userNameRoot?.querySelectorAll?.('a[href^="/"]') || [])]
+    .find((anchor) => {
+      const href = String(anchor.getAttribute("href") || "");
+      return /^\/[^/?#]+\/?$/.test(href) && !href.includes("/status/");
+    });
+  const profileMatch = String(profileAnchor?.getAttribute("href") || "").match(/^\/([^/?#]+)/);
+  if (profileMatch?.[1]) return profileMatch[1];
+
+  const statusMatch = String(canonicalHref || "").match(/^\/?([^/?#]+)\/status\//);
+  return statusMatch?.[1] || cachedUsername || null;
+}
+
+function snapshotOriginalPost(candidate) {
+  if (!candidate) return null;
+  return {
+    x_id: candidate.x_id,
+    comment_id: candidate.comment_id || candidate.x_id,
+    client_key: candidate.client_key || `x:${candidate.x_id}`,
+    message: candidate.message || "",
+    author_username: candidate.author_username || null,
+    author_name: candidate.author_name || candidate.author_username || null,
+    url: candidate.url || location.href,
+    element: candidate.element || null,
+  };
+}
+
+function pinOriginalPost(candidate) {
+  const threadStatusId = currentThreadStatusId();
+  if (!threadStatusId || candidate?.x_id !== threadStatusId || !candidate?.author_username) return false;
+
+  const candidateUsername = normalizedUsername(candidate.author_username);
+  const lock = state.threadOwnerLock;
+  if (lock?.threadStatusId === threadStatusId) {
+    if (candidateUsername !== lock.normalizedUsername) {
+      console.warn("[WeLivedIt] ignored original-owner drift while scrolling", {
+        threadStatusId,
+        pinnedUsername: lock.username,
+        candidateUsername: candidate.author_username,
+        candidateUrl: candidate.url || null,
+      });
+      return false;
+    }
+
+    // Keep the owner immutable. Only refresh non-identity presentation fields.
+    state.originalPost = {
+      ...state.originalPost,
+      message: candidate.message || state.originalPost?.message || "",
+      author_name: candidate.author_name || state.originalPost?.author_name || lock.username,
+      url: state.originalPost?.url || candidate.url || location.href,
+      element: candidate.element || state.originalPost?.element || null,
+    };
+    return true;
+  }
+
+  const pinned = snapshotOriginalPost(candidate);
+  state.threadOwnerLock = {
+    threadStatusId,
+    username: candidate.author_username,
+    normalizedUsername: candidateUsername,
+  };
+  state.originalPost = pinned;
+  console.info("[WeLivedIt] pinned original thread owner", {
+    threadStatusId,
+    username: candidate.author_username,
+  });
+  return true;
 }
 
 function extractAuthorDisplayName(article, username, cachedName = null) {
@@ -490,13 +731,11 @@ function extractArticleData(article) {
   if (!text && cached) return { ...cached, element: article };
   if (!text) return null;
 
-  const statusLink = [...article.querySelectorAll('a[href*="/status/"]')]
-    .map((a) => a.getAttribute("href") || a.href)
-    .find((href) => extractStatusIdFromHref(href));
+  const statusAnchor = canonicalStatusAnchor(article);
+  const statusLink = statusAnchor?.getAttribute("href") || statusAnchor?.href || null;
   const statusId = extractStatusIdFromHref(statusLink) || cached?.x_id;
   if (!statusId) return null;
-  const usernameMatch = String(statusLink || "").match(/^\/?([^/?#]+)\/status\//);
-  const authorUsername = usernameMatch ? usernameMatch[1] : cached?.author_username || null;
+  const authorUsername = articleAuthorUsername(article, statusLink, cached?.author_username);
   const authorName = extractAuthorDisplayName(article, authorUsername, cached?.author_name);
   const absoluteUrl = statusLink?.startsWith("http") ? statusLink : (statusLink ? `${location.origin}${statusLink}` : cached?.url || location.href);
   const data = { x_id: statusId, comment_id: statusId, client_key: `x:${statusId}`, message: text, author_username: authorUsername, author_name: authorName, url: absoluteUrl, element: article };
@@ -504,16 +743,68 @@ function extractArticleData(article) {
   return data;
 }
 
+function isOriginalForCurrentThread(candidate) {
+  const threadStatusId = currentThreadStatusId();
+  return Boolean(threadStatusId && candidate?.x_id === threadStatusId);
+}
+
+function selectThreadArticles(parsed, originalStatusId, pinnedOriginal = null) {
+  const validPinnedOriginal = pinnedOriginal?.x_id === originalStatusId ? pinnedOriginal : null;
+  const lockedUsername = state.threadOwnerLock?.threadStatusId === originalStatusId
+    ? state.threadOwnerLock.normalizedUsername
+    : null;
+
+  const visibleOriginalEntry = parsed.find((entry) => {
+    if (entry.data.x_id !== originalStatusId) return false;
+    if (!lockedUsername) return true;
+    return normalizedUsername(entry.data.author_username) === lockedUsername;
+  });
+  const visibleOriginal = visibleOriginalEntry?.data || null;
+
+  // Once pinned, the original snapshot has priority over every later DOM candidate.
+  // X recycles article nodes and replies may contain links to the parent status.
+  const original = validPinnedOriginal || visibleOriginal;
+  if (!original) {
+    return { original: null, replies: [], originalVisible: false };
+  }
+
+  const replies = parsed
+    .filter((entry) => {
+      if (entry.data.x_id !== originalStatusId) return true;
+      // The real original is excluded. A same-ID candidate with another author is
+      // malformed/ambiguous and must not be allowed to replace the owner.
+      return false;
+    })
+    .map((entry) => entry.data);
+
+  return { original, replies, originalVisible: Boolean(visibleOriginal) };
+}
+
 function getThreadArticles() {
   const originalStatusId = currentThreadStatusId();
-  if (!originalStatusId) return { original: null, replies: [], reason: "Open a reply conversation first. Replies will stay hidden until checked." };
+  if (!originalStatusId) {
+    return {
+      original: null,
+      replies: [],
+      reason: "Open a reply conversation first. Replies will stay hidden until checked.",
+      originalVisible: false,
+    };
+  }
+
   const articles = [...document.querySelectorAll("article")];
-  const parsed = articles.map((article) => ({ article, data: extractArticleData(article) })).filter((x) => x.data);
-  const originalIndex = parsed.findIndex((x) => x.data.x_id === originalStatusId);
-  const original = originalIndex >= 0 ? parsed[originalIndex].data : parsed[0]?.data || null;
-  const startIndex = originalIndex >= 0 ? originalIndex + 1 : 1;
-  const replies = parsed.slice(startIndex).map((x) => x.data).filter((item) => item.x_id !== originalStatusId);
-  return { original, replies, reason: null };
+  const parsed = articles
+    .map((article) => ({ article, data: extractArticleData(article) }))
+    .filter((entry) => entry.data);
+
+  const selected = selectThreadArticles(parsed, originalStatusId, state.originalPost);
+  if (!selected.original) {
+    return {
+      ...selected,
+      reason: "Waiting for the original post to be identified. Scroll to the top of the conversation once.",
+    };
+  }
+
+  return { ...selected, reason: null };
 }
 
 function scanVisibleReplies({ render = true, hide = true } = {}) {
@@ -522,8 +813,16 @@ function scanVisibleReplies({ render = true, hide = true } = {}) {
     setStatus(reason);
     return [];
   }
-  state.originalPost = original || state.originalPost;
-  scheduleThreadAccountRefresh(state.originalPost);
+  if (isOriginalForCurrentThread(original)) {
+    const hadPinnedOwner = Boolean(
+      state.threadOwnerLock?.threadStatusId === original.x_id &&
+      state.originalPost?.x_id === original.x_id
+    );
+    const accepted = pinOriginalPost(original);
+    if (accepted && (!hadPinnedOwner || !state.threadAccount?.accountId)) {
+      scheduleThreadAccountRefresh(state.originalPost);
+    }
+  }
   let newCount = 0;
   for (const [domOrder, reply] of replies.entries()) {
     state.domByKey.set(reply.client_key, reply.element);
@@ -567,15 +866,25 @@ function scanVisibleReplies({ render = true, hide = true } = {}) {
 }
 
 function getSelectedThreadContext() {
+  const threadStatusId = currentThreadStatusId();
+  const contextMatchesThread = Boolean(
+    threadStatusId &&
+    state.originalPost?.x_id === threadStatusId &&
+    state.threadOwnerLock?.threadStatusId === threadStatusId &&
+    normalizedUsername(state.originalPost?.author_username) === state.threadOwnerLock?.normalizedUsername &&
+    state.threadAccount?.postId === threadStatusId &&
+    state.threadAccount?.linkedToCommunity
+  );
   return {
     communityId: state.communityId || null,
-    accountId: state.threadAccount?.accountId || null,
+    accountId: contextMatchesThread ? state.threadAccount?.accountId || null : null,
   };
 }
 
 function buildPayload(items, originalOverride = null) {
   const { original } = getThreadArticles();
-  const originalPost = originalOverride || state.originalPost || original;
+  const originalCandidate = originalOverride || state.originalPost || original;
+  const originalPost = isOriginalForCurrentThread(originalCandidate) ? originalCandidate : null;
   const orderedItems = [...items].sort((a, b) => (a.dom_order ?? Number.MAX_SAFE_INTEGER) - (b.dom_order ?? Number.MAX_SAFE_INTEGER));
   const selectedContext = getSelectedThreadContext();
   return {
@@ -615,6 +924,7 @@ function buildPayload(items, originalOverride = null) {
 
 function emptyThreadAccount(overrides = {}) {
   return {
+    postId: null,
     username: null,
     accountName: null,
     accountId: null,
@@ -630,7 +940,11 @@ function emptyThreadAccount(overrides = {}) {
 
 function accountRequestPayload(originalOverride = null) {
   const original = originalOverride || state.originalPost;
-  if (!original?.author_username) return null;
+  const lockMatches = Boolean(
+    state.threadOwnerLock?.threadStatusId === currentThreadStatusId() &&
+    normalizedUsername(original?.author_username) === state.threadOwnerLock?.normalizedUsername
+  );
+  if (!isOriginalForCurrentThread(original) || !original?.author_username || !lockMatches) return null;
   return {
     community_id: state.communityId,
     platform: "x",
@@ -646,7 +960,15 @@ function applyThreadAccountResponse(response, fallbackOriginal = null) {
   const account = response?.account || response?.thread_account || response?.data?.account || response?.data?.thread_account;
   if (!account) return false;
   const original = fallbackOriginal || state.originalPost || {};
+  if (!isOriginalForCurrentThread(original) || state.originalPost?.x_id !== original.x_id) {
+    console.info("[WeLivedIt] ignored stale account response", {
+      responsePostId: original?.x_id || null,
+      currentThreadId: currentThreadStatusId(),
+    });
+    return false;
+  }
   state.threadAccount = emptyThreadAccount({
+    postId: original.x_id,
     username: account.username || original.author_username || null,
     accountName: account.account_name || account.accountName || original.author_name || original.author_username || null,
     accountId: account.account_id || account.accountId || account.id || null,
@@ -660,7 +982,10 @@ function applyThreadAccountResponse(response, fallbackOriginal = null) {
 
 function scheduleThreadAccountRefresh(originalOverride = null, { force = false } = {}) {
   const original = originalOverride || state.originalPost;
-  if (!original?.author_username) {
+  if (!isOriginalForCurrentThread(original) || !original?.author_username) {
+    // Do not erase a valid pinned owner merely because X virtualized the
+    // original post out of the visible DOM.
+    if (isOriginalForCurrentThread(state.originalPost)) return;
     state.threadAccount = emptyThreadAccount();
     state.threadAccountLookupKey = null;
     renderThreadAccount();
@@ -679,7 +1004,9 @@ async function refreshThreadAccount(originalOverride = null, { force = false } =
   const payload = accountRequestPayload(original);
   if (!payload) return null;
 
-  const lookupKey = `${state.apiBaseUrl}|${state.communityId}|x|${String(payload.username).toLowerCase()}`;
+  const requestGeneration = state.generation;
+  const requestThreadId = original.x_id;
+  const lookupKey = `${state.apiBaseUrl}|${state.communityId}|x|${requestThreadId}|${String(payload.username).toLowerCase()}`;
   if (!force && state.threadAccountLookupKey === lookupKey) {
     if (state.threadAccountLookupPromise) return state.threadAccountLookupPromise;
     if (!state.threadAccount.error && !state.threadAccount.loading) return state.threadAccount;
@@ -688,6 +1015,7 @@ async function refreshThreadAccount(originalOverride = null, { force = false } =
   state.threadAccountLookupKey = lookupKey;
   if (state.authEnabled && !state.authStatus.authenticated) {
     state.threadAccount = emptyThreadAccount({
+      postId: requestThreadId,
       username: payload.username,
       accountName: payload.account_name,
       status: "sign_in_required",
@@ -697,6 +1025,7 @@ async function refreshThreadAccount(originalOverride = null, { force = false } =
   }
 
   state.threadAccount = emptyThreadAccount({
+    postId: requestThreadId,
     username: payload.username,
     accountName: payload.account_name,
     status: "loading",
@@ -707,17 +1036,40 @@ async function refreshThreadAccount(originalOverride = null, { force = false } =
   const lookupPromise = (async () => {
     try {
       const response = await apiPost("/api/extension/accounts/resolve", payload);
-      applyThreadAccountResponse(response, original);
+      const requestIsCurrent =
+        state.generation === requestGeneration &&
+        state.threadAccountLookupKey === lookupKey &&
+        currentThreadStatusId() === requestThreadId &&
+        state.originalPost?.x_id === requestThreadId;
+      if (requestIsCurrent) {
+        applyThreadAccountResponse(response, original);
+      } else {
+        console.info("[WeLivedIt] discarded stale account lookup", {
+          requestThreadId,
+          currentThreadId: currentThreadStatusId(),
+          requestGeneration,
+          currentGeneration: state.generation,
+        });
+      }
     } catch (error) {
-      state.threadAccount = emptyThreadAccount({
-        username: payload.username,
-        accountName: payload.account_name,
-        status: "error",
-        error: String(error?.message || error),
-      });
-      renderThreadAccount();
+      const requestIsCurrent =
+        state.generation === requestGeneration &&
+        state.threadAccountLookupKey === lookupKey &&
+        currentThreadStatusId() === requestThreadId;
+      if (requestIsCurrent) {
+        state.threadAccount = emptyThreadAccount({
+          postId: requestThreadId,
+          username: payload.username,
+          accountName: payload.account_name,
+          status: "error",
+          error: String(error?.message || error),
+        });
+        renderThreadAccount();
+      }
     } finally {
-      state.threadAccountLookupPromise = null;
+      if (state.threadAccountLookupKey === lookupKey) {
+        state.threadAccountLookupPromise = null;
+      }
     }
     return state.threadAccount;
   })();
@@ -732,9 +1084,13 @@ async function ensureThreadContextReady() {
     return false;
   }
 
-  const original = state.originalPost || getThreadArticles().original;
-  if (!original?.author_username) {
-    setStatus("Open an X post so the original account can be identified.");
+  const threadStatusId = currentThreadStatusId();
+  const detectedOriginal = getThreadArticles().original;
+  const original = isOriginalForCurrentThread(state.originalPost)
+    ? state.originalPost
+    : detectedOriginal;
+  if (!threadStatusId || !isOriginalForCurrentThread(original) || !original?.author_username) {
+    setStatus("Open the original X post (or scroll to its top once) so its account can be identified.");
     return false;
   }
 
@@ -743,6 +1099,11 @@ async function ensureThreadContextReady() {
   if (!account?.accountId) {
     const detail = account?.error ? ` ${account.error}` : "";
     setStatus(`The original post account has not been identified yet.${detail}`);
+    renderPanel();
+    return false;
+  }
+  if (!account.linkedToCommunity) {
+    setStatus("This post owner is not a monitored account in the selected community. The viewer's account will not be used as a fallback.");
     renderPanel();
     return false;
   }
@@ -781,6 +1142,7 @@ function renderThreadAccount() {
   if (!box || !usernameEl || !statusEl || !saveButton) return;
 
   const account = state.threadAccount || emptyThreadAccount();
+  updateSendPermissionsUi();
   usernameEl.textContent = account.username ? `@${account.username}` : "Not detected";
   statusEl.className = "welivedit-account-status";
 
@@ -802,7 +1164,7 @@ function renderThreadAccount() {
     return;
   }
   if (account.linkedToCommunity) {
-    statusEl.textContent = `Configured for ${state.communityId}${account.accountId ? ` · DB ${account.accountId}` : ""}. Posts will use this account.`;
+    statusEl.textContent = `Configured for ${state.communityId}${account.accountId ? ` · DB ${account.accountId}` : ""}. Comments will be linked to this post owner.`;
     statusEl.classList.add("ok");
     saveButton.hidden = true;
     return;
@@ -843,6 +1205,8 @@ function minimalClassification(classification) {
     classification_id: classification.classification_id || classification.id || null,
     type_of_harm: classification.type_of_harm || classification.label || "none",
     content_tone: classification.content_tone || null,
+    severity: classification.severity || null,
+    severity_score: classification.severity_score ?? null,
     confidence: classification.confidence ?? null,
     evidence_quote: classification.evidence_quote || "",
     reason: classification.reason || "",
@@ -1161,6 +1525,7 @@ async function enqueueUnprocessedItems({ manual = false } = {}) {
   }
   scanVisibleReplies({ render: false, hide: true });
   if (!(await ensureThreadContextReady())) return 0;
+  if (!ensureViewerOwnsCurrentPost()) return 0;
   const items = [...state.items.values()].sort((a, b) => (a.dom_order ?? Number.MAX_SAFE_INTEGER) - (b.dom_order ?? Number.MAX_SAFE_INTEGER));
   const candidates = items.filter((item) => (
     !item.classified &&
@@ -1194,7 +1559,16 @@ function scheduleAutoEnqueue() {
 }
 
 async function onAutoModeChanged(event) {
-  state.autoMode = Boolean(event?.target?.checked);
+  const requested = Boolean(event?.target?.checked);
+  if (requested && state.authStatus.authenticated && !getThreadSendPermission().allowed) {
+    state.autoMode = false;
+    if (event?.target) event.target.checked = false;
+    await storageSet({ [STORAGE_KEYS.autoMode]: false });
+    setStatus(getThreadSendPermission().reason);
+    renderPanel();
+    return;
+  }
+  state.autoMode = requested;
   await storageSet({ [STORAGE_KEYS.autoMode]: state.autoMode });
   setStatus(state.autoMode ? "Auto-check is on." : "Auto-check is off.");
   if (state.autoMode) scheduleAutoEnqueue();
@@ -1209,6 +1583,7 @@ async function retryItem(clientKey) {
     return;
   }
   if (!(await ensureThreadContextReady())) return;
+  if (!ensureViewerOwnsCurrentPost()) return;
   enqueueItem(item, { manual: true });
   setStatus("Retry queued.");
   renderPanel();
@@ -1311,6 +1686,15 @@ async function sendVisibleToCommunity({ triggeredByLogin = false } = {}) {
 
 
 async function apiPost(path, body) {
+  if (
+    path === "/api/extension/x-comments/resolve" ||
+    path === "/api/extension/x-comments/analyze"
+  ) {
+    const permission = getThreadSendPermission();
+    if (!permission.allowed) {
+      throw new Error(permission.reason || "This post is not owned by your linked X account.");
+    }
+  }
   const url = `${state.apiBaseUrl}${path}`;
   logCheckStep("apiPost through background", {
     path,
@@ -1512,18 +1896,59 @@ function positionCover(article, cover) {
   cover.classList.add("is-visible");
 }
 
+function showRehideControl(article, cover, clientKey) {
+  if (!article?.isConnected || !cover) return;
+  cover.classList.add("is-rehide", "is-visible");
+  cover.setAttribute("aria-hidden", "false");
+
+  if (cover.dataset.weliveditRehideFor === clientKey && cover.querySelector("button")) return;
+
+  cover.dataset.weliveditRehideFor = clientKey;
+  cover.innerHTML = `<button type="button" aria-label="Hide this reply again on X">Hide again</button>`;
+  cover.querySelector("button")?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    event.preventDefault();
+    const item = state.items.get(clientKey);
+    if (!item) return;
+    item.manualRevealed = false;
+    applyHidden(
+      clientKey,
+      true,
+      item.classified && isHarmful(item.classification)
+        ? "Message hidden. It may need care."
+        : "Message hidden.",
+      { force: true }
+    );
+    setStatus("Reply hidden again on X.");
+    renderPanel();
+  });
+}
+
 function updateAllPortalCovers() {
   for (const [clientKey, cover] of state.coverByKey.entries()) {
     const item = state.items.get(clientKey);
     const article = item?.element || state.domByKey.get(clientKey);
-    if (!item || !item.hidden || item.manualRevealed || !article?.isConnected) {
-      cover?.classList?.remove("is-visible");
+    if (!item || !article?.isConnected) {
+      cover?.classList?.remove("is-visible", "is-rehide");
       continue;
     }
-    positionCover(article, cover);
+
+    if (item.hidden) {
+      cover.classList.remove("is-rehide");
+      delete cover.dataset.weliveditRehideFor;
+      positionCover(article, cover);
+      continue;
+    }
+
+    if (item.manualRevealed) {
+      showRehideControl(article, cover, clientKey);
+      continue;
+    }
+
+    cover.classList.remove("is-visible", "is-rehide");
+    delete cover.dataset.weliveditRehideFor;
   }
 }
-
 function applyHidden(clientKey, hidden, label = "Message hidden until it is checked.", options = {}) {
   const item = state.items.get(clientKey);
   const article = item?.element || state.domByKey.get(clientKey);
@@ -1536,6 +1961,8 @@ function applyHidden(clientKey, hidden, label = "Message hidden until it is chec
   item.hidden = hidden;
   if (hidden) {
     item.manualRevealed = false;
+    cover.classList.remove("is-rehide");
+    delete cover.dataset.weliveditRehideFor;
     article.classList.add("welivedit-hard-hidden");
     article.setAttribute("data-welivedit-hidden", "true");
     applyRedactionShell(article);
@@ -1546,21 +1973,25 @@ function applyHidden(clientKey, hidden, label = "Message hidden until it is chec
       event.stopPropagation();
       event.preventDefault();
       item.manualRevealed = true;
-      cover.classList.remove("is-visible");
-      cover.setAttribute("aria-hidden", "true");
       applyHidden(clientKey, false, "", { manual: true });
+      setStatus("Reply shown on X. Use Hide again to conceal it when finished.");
       renderPanel();
     }, { once: true });
   } else {
     article.classList.remove("welivedit-hard-hidden");
     article.removeAttribute("data-welivedit-hidden");
     restoreRedactionShell(article);
-    cover.setAttribute("aria-hidden", "true");
-    cover.classList.remove("is-visible");
-    cover.innerHTML = "";
+
+    if (options.manual || item.manualRevealed) {
+      showRehideControl(article, cover, clientKey);
+    } else {
+      cover.setAttribute("aria-hidden", "true");
+      cover.classList.remove("is-visible", "is-rehide");
+      delete cover.dataset.weliveditRehideFor;
+      cover.innerHTML = "";
+    }
   }
 }
-
 function toggleVisibility(clientKey) {
   const item = state.items.get(clientKey);
   if (!item) return;
@@ -1574,13 +2005,73 @@ function toggleVisibility(clientKey) {
   renderPanel();
 }
 
+function exactArticleForItem(item) {
+  if (!item) return null;
+  const expectedId = String(item.x_id || item.comment_id || "");
+  const expectedAuthor = normalizedUsername(item.author_username);
+  const direct = item.element || state.domByKey.get(item.client_key);
+  if (direct?.isConnected) {
+    const directData = extractArticleData(direct);
+    if (
+      String(directData?.x_id || "") === expectedId &&
+      (!expectedAuthor || normalizedUsername(directData?.author_username) === expectedAuthor)
+    ) return direct;
+  }
+
+  let idOnlyMatch = null;
+  for (const article of document.querySelectorAll("article")) {
+    const data = extractArticleData(article);
+    if (String(data?.x_id || "") !== expectedId) continue;
+    if (!idOnlyMatch) idOnlyMatch = article;
+    if (!expectedAuthor || normalizedUsername(data?.author_username) === expectedAuthor) return article;
+  }
+  return idOnlyMatch;
+}
+
+function temporarilyHighlightArticle(article) {
+  if (!article) return;
+  article.classList.remove("welivedit-focus-highlight");
+  void article.offsetWidth;
+  article.classList.add("welivedit-focus-highlight");
+  window.setTimeout(() => article.classList.remove("welivedit-focus-highlight"), 2600);
+}
+
+function focusItemOnX(clientKey) {
+  const item = state.items.get(clientKey);
+  if (!item) return;
+
+  item.manualRevealed = true;
+  applyHidden(clientKey, false, "", { manual: true });
+  const article = exactArticleForItem(item);
+
+  if (article) {
+    document.getElementById("welivedit-panel")?.classList.remove("open");
+    article.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+    temporarilyHighlightArticle(article);
+    window.setTimeout(() => temporarilyHighlightArticle(article), 450);
+    setStatus(`Focused ${item.author_username ? `@${item.author_username}` : "reply"} on X.`);
+  } else if (item.url) {
+    const opened = window.open(item.url, "_blank", "noopener,noreferrer");
+    if (opened) {
+      setStatus("The reply was no longer loaded in this scroll, so its exact X URL was opened in a new tab.");
+    } else {
+      setStatus("The reply is no longer loaded. Allow pop-ups to open its exact X URL.");
+    }
+  } else {
+    setStatus("This reply is no longer loaded and has no exact X URL available.");
+  }
+  renderPanel();
+}
+
 function renderPanel() {
   updateAuthUi();
   renderThreadAccount();
+  updateSendPermissionsUi();
   const summary = document.getElementById("welivedit-summary");
   const content = document.getElementById("welivedit-content");
   if (!summary || !content) return;
   const items = [...state.items.values()].sort((a, b) => (a.dom_order ?? Number.MAX_SAFE_INTEGER) - (b.dom_order ?? Number.MAX_SAFE_INTEGER));
+  renderCommentClimate(items);
   const active = items.filter((x) => state.inFlight.has(x.client_key)).length;
   const queuedCount = items.filter((x) => state.queued.has(x.client_key)).length;
   const waiting = items.filter((x) => !x.classified && x.status !== "error" && !state.inFlight.has(x.client_key) && !state.queued.has(x.client_key)).length;
@@ -1611,9 +2102,12 @@ function renderPanel() {
       body = `<div class="welivedit-card-placeholder">${escapeHtml(coverLabelForItem(item))}</div>`;
     }
 
-    const action = item.status === "error"
-      ? `<div class="welivedit-card-actions"><button data-action="retry">Retry</button></div>`
-      : (item.classified ? `<div class="welivedit-card-actions"><button data-action="toggle">${item.hidden ? "Show on X" : "Hide on X"}</button></div>` : "");
+    const focusLabel = item.hidden ? "Show & focus on X" : "Focus on X";
+    const retryButton = item.status === "error" ? `<button data-action="retry">Retry</button>` : "";
+    const hideButton = item.classified && !item.hidden
+      ? `<button data-action="toggle">${item.manualRevealed ? "Hide again on X" : "Hide on X"}</button>`
+      : "";
+    const action = `<div class="welivedit-card-actions">${retryButton}<button data-action="focus">${focusLabel}</button>${hideButton}</div>`;
 
     card.innerHTML = `
       <div class="welivedit-card-head">
@@ -1623,13 +2117,17 @@ function renderPanel() {
       ${body}
       ${action}`;
     card.querySelector('[data-action="retry"]')?.addEventListener("click", () => retryItem(item.client_key));
+    card.querySelector('[data-action="focus"]')?.addEventListener("click", () => focusItemOnX(item.client_key));
     card.querySelector('[data-action="toggle"]')?.addEventListener("click", () => toggleVisibility(item.client_key));
     content.appendChild(card);
   }
 } 
 
 function pageKey() {
-  return location.href;
+  // Ignore query/hash churn. Only a different /status/:id should reset a thread.
+  const threadStatusId = currentThreadStatusId();
+  if (threadStatusId) return `${location.hostname}|status:${threadStatusId}`;
+  return `${location.hostname}${location.pathname}`;
 }
 
 function removeAllPortalCovers() {
@@ -1660,12 +2158,15 @@ function resetThreadStateForNavigation(reason = "navigation") {
   state.workQueue = [];
   state.lastPayload = null;
   state.originalPost = null;
+  state.threadOwnerLock = null;
   clearTimeout(state.threadAccountLookupTimer);
   state.threadAccountLookupTimer = null;
   state.threadAccountLookupKey = null;
   state.threadAccountLookupPromise = null;
   state.threadAccount = emptyThreadAccount();
   state.currentPageKey = pageKey();
+  state.explicitNavigationStatusId = null;
+  state.explicitNavigationAt = 0;
   setStatus("New X page detected.");
   window.setTimeout(() => {
     scanVisibleReplies({ render: true, hide: true });
@@ -1683,6 +2184,13 @@ function scheduleNavigationReset(reason = "navigation") {
   state.navigationResetTimer = window.setTimeout(() => {
     if (pageKey() !== state.currentPageKey) resetThreadStateForNavigation(reason);
   }, 250);
+}
+
+function markExplicitNavigation(statusId, source = "click") {
+  if (!statusId) return;
+  state.explicitNavigationStatusId = statusId;
+  state.explicitNavigationAt = Date.now();
+  console.info("[WeLivedIt] explicit X thread navigation", { statusId, source });
 }
 
 function startNavigationWatcher() {
@@ -1704,7 +2212,18 @@ function startNavigationWatcher() {
     return result;
   };
 
-  window.addEventListener("popstate", () => scheduleNavigationReset("popstate"));
+  document.addEventListener("click", (event) => {
+    const anchor = event.target?.closest?.('a[href*="/status/"]');
+    const targetStatusId = extractStatusIdFromHref(anchor?.getAttribute?.("href") || anchor?.href);
+    if (targetStatusId && targetStatusId !== state.threadOwnerLock?.threadStatusId) {
+      markExplicitNavigation(targetStatusId, "status-link-click");
+    }
+  }, true);
+
+  window.addEventListener("popstate", () => {
+    markExplicitNavigation(locationThreadStatusId(), "popstate");
+    scheduleNavigationReset("popstate");
+  });
   window.addEventListener("hashchange", () => scheduleNavigationReset("hashchange"));
   window.setInterval(() => scheduleNavigationReset("url-poll"), 1000);
 }
@@ -1736,6 +2255,94 @@ function startThreadObserver() {
     }, DOM_SCAN_DEBOUNCE_MS);
   });
   observer.observe(document.body, { childList: true, subtree: true });
+}
+
+function clampPercent(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(100, Math.round(parsed)));
+}
+
+function isDangerousClassification(classification) {
+  if (!classification || typeof classification !== "object") return false;
+  const severity = String(classification.severity || "").trim().toLowerCase();
+  const score = Number(classification.severity_score ?? classification.severityScore ?? 0);
+  return severity === "dangerous" || (Number.isFinite(score) && score >= 3);
+}
+
+function climateLevel(safePercent, { hasDangerous = false } = {}) {
+  const normalized = clampPercent(safePercent, 0);
+  if (COMMENT_CLIMATE_CONFIG.forceNeutralWhenDangerous && hasDangerous) {
+    return { emoji: "😐", label: "Needs protection", level: "neutral" };
+  }
+  if (normalized >= COMMENT_CLIMATE_CONFIG.veryHappyMinSafePercent) {
+    return { emoji: "😄", label: "Very safe", level: "very_happy" };
+  }
+  if (normalized >= COMMENT_CLIMATE_CONFIG.happyMinSafePercent) {
+    return { emoji: "🙂", label: "Mostly safe", level: "happy" };
+  }
+  return { emoji: "😐", label: "Needs protection", level: "neutral" };
+}
+
+function calculateCommentClimate(items) {
+  const classified = items.filter((item) => item.classified && item.classification);
+  const harmful = classified.filter((item) => isHarmful(item.classification));
+  const safe = classified.length - harmful.length;
+  const safePercent = classified.length ? Math.round((safe / classified.length) * 100) : null;
+  const hasDangerous = harmful.some((item) => isDangerousClassification(item.classification));
+
+  const visible = classified.filter((item) => !item.hidden || item.manualRevealed);
+  const visibleHarmful = visible.filter((item) => isHarmful(item.classification));
+  const visibleSafe = visible.length - visibleHarmful.length;
+  const visibleSafePercent = classified.length
+    ? (visible.length ? Math.round((visibleSafe / visible.length) * 100) : 100)
+    : null;
+  const visibleHasDangerous = visibleHarmful.some((item) => isDangerousClassification(item.classification));
+
+  return {
+    classifiedCount: classified.length,
+    safeCount: safe,
+    harmfulCount: harmful.length,
+    harmfulHiddenCount: harmful.filter((item) => item.hidden && !item.manualRevealed).length,
+    safePercent,
+    visibleSafePercent,
+    before: safePercent === null ? null : climateLevel(safePercent, { hasDangerous }),
+    after: visibleSafePercent === null ? null : climateLevel(visibleSafePercent, { hasDangerous: visibleHasDangerous }),
+    hasDangerous,
+  };
+}
+
+function climateResultHtml(level, percent) {
+  if (!level || percent === null) return "";
+  return `<div class="welivedit-climate-result"><span class="welivedit-climate-emoji" aria-hidden="true">${level.emoji}</span><span class="welivedit-climate-value">${percent}% safe<small>${escapeHtml(level.label)}</small></span></div>`;
+}
+
+function renderCommentClimate(items) {
+  const container = document.getElementById("welivedit-climate");
+  if (!container) return;
+  const climate = calculateCommentClimate(items);
+  if (!climate.classifiedCount) {
+    container.innerHTML = `<div class="welivedit-climate-title">Comment climate</div><div class="welivedit-climate-empty">Waiting for checked replies.</div>`;
+    return;
+  }
+
+  const dangerNote = climate.hasDangerous
+    ? `<div class="welivedit-climate-note">A dangerous reply keeps the pre-protection climate neutral, even when the safe percentage is high.</div>`
+    : "";
+  const impact = climate.harmfulHiddenCount
+    ? `<div class="welivedit-climate-impact">${climate.harmfulHiddenCount} harmful ${climate.harmfulHiddenCount === 1 ? "reply" : "replies"} hidden from view.</div>`
+    : "";
+  container.innerHTML = `
+    <div class="welivedit-climate-title">Comment climate</div>
+    <div class="welivedit-climate-grid">
+      <div class="welivedit-climate-label">Before protection</div>
+      ${climateResultHtml(climate.before, climate.safePercent)}
+      <div class="welivedit-climate-label">Visible now</div>
+      ${climateResultHtml(climate.after, climate.visibleSafePercent)}
+    </div>
+    ${impact}
+    ${dangerNote}
+    <div class="welivedit-climate-note">Based on ${climate.classifiedCount} checked ${climate.classifiedCount === 1 ? "reply" : "replies"}. Thresholds: 🙂 ${COMMENT_CLIMATE_CONFIG.happyMinSafePercent}% · 😄 ${COMMENT_CLIMATE_CONFIG.veryHappyMinSafePercent}%.</div>`;
 }
 
 function isHarmful(classification) {

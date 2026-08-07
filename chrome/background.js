@@ -6,6 +6,7 @@ const STORAGE_KEYS = {
   authToken: "welivedit_auth_token",
   authSession: "welivedit_auth_session",
   authEmail: "welivedit_auth_email",
+  authProfileFetchedAt: "welivedit_auth_profile_fetched_at",
 };
 
 function storageGet(keys) {
@@ -58,6 +59,29 @@ function extractToken(json) {
     json?.user?.token ||
     null
   );
+}
+
+
+function extractViewerIdentity(session) {
+  const user = session?.data?.user || session?.user || session?.data || null;
+  if (!user || typeof user !== "object") {
+    return { userId: null, linkedAccounts: [] };
+  }
+  const accounts = Array.isArray(user.accounts) ? user.accounts : [];
+  return {
+    userId: user.id || user.user_id || user.userId || null,
+    linkedAccounts: accounts.map((account) => ({
+      accountId: account.id || account.account_id || account.accountId || null,
+      platform: account.platform || account.accountType || null,
+      username: account.username || null,
+      communities: Array.isArray(account.communities)
+        ? account.communities.map((community) => ({
+            communityId: community.id || community.community_id || community.communityId || null,
+            name: community.communityName || community.name || null,
+          }))
+        : [],
+    })),
+  };
 }
 
 function parseTextAsJson(text) {
@@ -116,13 +140,50 @@ async function requestJsonWithFallback(args) {
   return result;
 }
 
+async function fetchAuthProfile(token) {
+  if (!token) return null;
+  const result = await requestJsonWithFallback({
+    url: `${DEFAULT_AUTH_BASE_URL}/api/auth/profile`,
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+    timeoutMs: 30000,
+  });
+  if (!result.ok || result.data?.success === false) {
+    console.warn("[WeLivedIt background] profile lookup failed", result.status, result.data || result.error);
+    return null;
+  }
+  return result.data || null;
+}
+
 async function handleAuthStatus() {
-  const stored = await storageGet([STORAGE_KEYS.authToken, STORAGE_KEYS.authSession, STORAGE_KEYS.authEmail]);
+  const stored = await storageGet([
+    STORAGE_KEYS.authToken,
+    STORAGE_KEYS.authSession,
+    STORAGE_KEYS.authEmail,
+    STORAGE_KEYS.authProfileFetchedAt,
+  ]);
+  const token = stored[STORAGE_KEYS.authToken] || null;
+  let session = stored[STORAGE_KEYS.authSession] || null;
+  const lastProfileFetch = Number(stored[STORAGE_KEYS.authProfileFetchedAt] || 0);
+  const profileIsStale = !lastProfileFetch || Date.now() - lastProfileFetch > 5 * 60 * 1000;
+
+  if (token && profileIsStale) {
+    const profile = await fetchAuthProfile(token);
+    if (profile) {
+      session = profile;
+      await storageSet({
+        [STORAGE_KEYS.authSession]: profile,
+        [STORAGE_KEYS.authProfileFetchedAt]: Date.now(),
+      });
+    }
+  }
+
   return {
     ok: true,
-    authenticated: Boolean(stored[STORAGE_KEYS.authToken]),
+    authenticated: Boolean(token),
     email: stored[STORAGE_KEYS.authEmail] || null,
-    session: stored[STORAGE_KEYS.authSession] || null,
+    session,
+    viewer: extractViewerIdentity(session),
   };
 }
 
@@ -164,17 +225,27 @@ async function handleAuthLogin(payload = {}) {
     };
   }
 
+  const profile = await fetchAuthProfile(token);
+  const session = profile || data;
   await storageSet({
     [STORAGE_KEYS.authToken]: token,
-    [STORAGE_KEYS.authSession]: data,
+    [STORAGE_KEYS.authSession]: session,
     [STORAGE_KEYS.authEmail]: email,
+    [STORAGE_KEYS.authProfileFetchedAt]: profile ? Date.now() : 0,
   });
 
-  return { ok: true, status: result.status, authenticated: true, email, data };
+  return {
+    ok: true,
+    status: result.status,
+    authenticated: true,
+    email,
+    viewer: extractViewerIdentity(session),
+    data: session,
+  };
 }
 
 async function handleAuthLogout() {
-  await storageRemove([STORAGE_KEYS.authToken, STORAGE_KEYS.authSession, STORAGE_KEYS.authEmail]);
+  await storageRemove([STORAGE_KEYS.authToken, STORAGE_KEYS.authSession, STORAGE_KEYS.authEmail, STORAGE_KEYS.authProfileFetchedAt]);
   return { ok: true, authenticated: false };
 }
 
@@ -209,7 +280,7 @@ async function handleApiRequest(message) {
   console.info("[WeLivedIt background response]", result.status, data || result.error);
 
   if (result.status === 401 || result.status === 403) {
-    await storageRemove([STORAGE_KEYS.authToken, STORAGE_KEYS.authSession, STORAGE_KEYS.authEmail]);
+    await storageRemove([STORAGE_KEYS.authToken, STORAGE_KEYS.authSession, STORAGE_KEYS.authEmail, STORAGE_KEYS.authProfileFetchedAt]);
     return {
       ok: false,
       status: result.status,

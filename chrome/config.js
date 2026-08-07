@@ -9,4 +9,13 @@ globalThis.WELIVEDIT_CONFIG = Object.freeze({
   RESOLVE_BATCH_SIZE: 40,
   DOM_SCAN_DEBOUNCE_MS: 300,
   AUTO_ENQUEUE_DEBOUNCE_MS: 180,
+
+  // Comment-climate emoji thresholds, based on the percentage of checked
+  // replies classified as safe. Change only these two values to tune the UI.
+  // < 70% = 😐, 70–89% = 🙂, >= 90% = 😄 by default.
+  COMMENT_CLIMATE: {
+    HAPPY_MIN_SAFE_PERCENT: 70,
+    VERY_HAPPY_MIN_SAFE_PERCENT: 90,
+    FORCE_NEUTRAL_WHEN_DANGEROUS: true,
+  },
 });

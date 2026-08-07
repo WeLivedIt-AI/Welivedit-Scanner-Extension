@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "WeliveditAi X Scanner",
-  "version": "5.0.2",
-  "description": "WeLivedIt X helper. Sends the selected community_id and original-post account_id at request, post, and comment level for reliable database storage.",
+  "version": "5.1.4",
+  "description": "WeLivedIt X helper with original-post owner lock, own-post-only sending, exact reply focus, re-hide controls, and configurable comment-climate emojis.",
   "permissions": [
     "storage",
     "https://x.com/*",
