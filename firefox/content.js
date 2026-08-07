@@ -1,5 +1,5 @@
 
-console.info("[WeLivedIt Firefox v5.1.3] content.js loaded", {
+console.info("[WeLivedIt Firefox v5.2.1] content.js loaded", {
   href: location.href,
   readyState: document.readyState,
   origin: location.origin,
@@ -11,7 +11,7 @@ window.__weliveditV50Loaded = true;
 window.__weliveditFirefoxV504Loaded = true;
 window.__weliveditFirefoxV511Loaded = true;
 window.__weliveditFirefoxV512Loaded = true;
-window.__weliveditFirefoxV513Loaded = true;
+window.__weliveditFirefoxV521Loaded = true;
 
 const DEFAULT_API_BASE_URL = globalThis.WELIVEDIT_CONFIG?.API_BASE_URL || "https://welivedit-ai-servicev2-production.up.railway.app";
 const DEFAULT_AUTH_BASE_URL = globalThis.WELIVEDIT_CONFIG?.AUTH_BASE_URL || "https://welivedit-service-server-production-7991.up.railway.app";
@@ -495,7 +495,7 @@ async function ensureAuthIfNeeded() {
   if (state.authStatus.authenticated) return true;
   await refreshAuthStatus(false);
   if (state.authStatus.authenticated) return true;
-  setStatus("Please sign in once before sending replies.");
+  setStatus("Please sign in once before analyzing replies.");
   document.getElementById("welivedit-panel")?.classList.add("open");
   return false;
 }
@@ -504,80 +504,118 @@ function normalizeAccountId(value) {
   return String(value || "").trim().toLowerCase();
 }
 
-function viewerLinkedAccountForThread() {
-  const targetAccountId = normalizeAccountId(state.threadAccount?.accountId);
-  if (!targetAccountId) return null;
-  return (state.viewerIdentity?.linkedAccounts || []).find((account) => (
-    normalizeAccountId(account?.accountId) === targetAccountId &&
-    (!account?.platform || String(account.platform).toLowerCase() === "x")
-  )) || null;
+function accountBelongsToSelectedCommunity(account) {
+  const selected = String(state.communityId || "").trim().toLowerCase();
+  if (!selected) return false;
+  const communities = Array.isArray(account?.communities) ? account.communities : [];
+  return communities.some((community) => {
+    const id = String(community?.communityId || "").trim().toLowerCase();
+    const name = String(community?.name || "").trim().toLowerCase();
+    return selected === id || selected === name;
+  });
+}
+
+function viewerLinkedAccountForOriginalPost() {
+  const originalUsername = normalizedUsername(state.originalPost?.author_username);
+  const resolvedAccountId = normalizeAccountId(state.threadAccount?.accountId);
+  const linkedAccounts = state.viewerIdentity?.linkedAccounts || [];
+
+  return linkedAccounts.find((account) => {
+    if (account?.platform && String(account.platform).toLowerCase() !== "x") return false;
+    if (!accountBelongsToSelectedCommunity(account)) return false;
+
+    const accountId = normalizeAccountId(account?.accountId);
+    const username = normalizedUsername(account?.username);
+    const idMatches = Boolean(resolvedAccountId && accountId && resolvedAccountId === accountId);
+    const usernameMatches = Boolean(originalUsername && username && originalUsername === username);
+    return idMatches || usernameMatches;
+  }) || null;
+}
+
+function getThreadAnalysisPermission() {
+  if (!state.authStatus.authenticated) {
+    return { allowed: false, canPromptLogin: true, reason: "Sign in to analyze replies." };
+  }
+  if (!state.communityId) {
+    return { allowed: false, reason: "No community is selected." };
+  }
+  const threadStatusId = currentThreadStatusId();
+  if (!threadStatusId || !isOriginalForCurrentThread(state.originalPost) || !state.originalPost?.author_username) {
+    return { allowed: false, reason: "Open the original X post (or scroll to its top once) before analyzing replies." };
+  }
+  return { allowed: true };
+}
+
+function getThreadStoragePermission() {
+  const analysis = getThreadAnalysisPermission();
+  if (!analysis.allowed) return { allowed: false, reason: analysis.reason };
+
+  const viewerAccount = viewerLinkedAccountForOriginalPost();
+  if (!viewerAccount?.accountId) {
+    return {
+      allowed: false,
+      reason: "This is not one of your linked X posts. Replies will be analyzed without being stored.",
+    };
+  }
+
+  const resolvedAccountId = normalizeAccountId(state.threadAccount?.accountId);
+  const viewerAccountId = normalizeAccountId(viewerAccount.accountId);
+  if (resolvedAccountId && resolvedAccountId !== viewerAccountId) {
+    return {
+      allowed: false,
+      reason: "The detected post owner does not match your linked X account. Replies will not be stored.",
+    };
+  }
+
+  return { allowed: true, viewerAccount, accountId: viewerAccount.accountId };
 }
 
 function getThreadSendPermission() {
-  if (!state.authStatus.authenticated) {
-    return { allowed: false, canPromptLogin: true, reason: "Sign in to verify that this is your own X post." };
-  }
-  if (state.threadAccount?.loading) {
-    return { allowed: false, reason: "Checking who owns the original post…" };
-  }
-  if (!state.threadAccount?.accountId) {
-    return { allowed: false, reason: "The original post account has not been identified yet." };
-  }
-  if (!state.threadAccount?.linkedToCommunity) {
-    return { allowed: false, reason: "This post owner is not configured in the selected community." };
-  }
-  const viewerAccount = viewerLinkedAccountForThread();
-  if (!viewerAccount) {
-    return {
-      allowed: false,
-      reason: "You can send replies only from posts owned by one of your linked X accounts.",
-    };
-  }
-  return { allowed: true, viewerAccount };
+  // Kept as a compatibility alias for older UI code. "Send" now means analyze;
+  // storage is decided independently by getThreadStoragePermission().
+  return getThreadAnalysisPermission();
 }
 
 function updateSendPermissionsUi() {
   const sendButton = document.getElementById("welivedit-send");
   const autoInput = document.getElementById("welivedit-auto-mode");
   const autoRow = autoInput?.closest?.(".welivedit-auto-row") || null;
-  const permission = getThreadSendPermission();
+  const analysis = getThreadAnalysisPermission();
+  const storage = getThreadStoragePermission();
 
   if (sendButton) {
     if (!state.authStatus.authenticated) {
       sendButton.disabled = false;
-      sendButton.textContent = "Sign in to send replies";
-      sendButton.title = "Sign in first; ownership will be checked before anything is sent.";
-    } else if (permission.allowed) {
-      sendButton.disabled = false;
-      sendButton.textContent = "Send replies to community";
-      sendButton.title = "This original post belongs to your linked X account.";
-    } else {
+      sendButton.textContent = "Sign in to analyze replies";
+      sendButton.title = "Sign in first; analysis is available on any post.";
+    } else if (!analysis.allowed) {
       sendButton.disabled = true;
-      sendButton.textContent = "Only your own posts can be sent";
-      sendButton.title = permission.reason;
+      sendButton.textContent = "Open a post to analyze";
+      sendButton.title = analysis.reason;
+    } else if (storage.allowed) {
+      sendButton.disabled = false;
+      sendButton.textContent = "Analyze & save replies";
+      sendButton.title = "This is your linked X post. Results and replies may be stored.";
+    } else {
+      sendButton.disabled = false;
+      sendButton.textContent = "Analyze replies (not saved)";
+      sendButton.title = storage.reason;
     }
   }
 
   if (autoInput) {
-    const ownershipKnownAndDenied = Boolean(
-      state.authStatus.authenticated &&
-      state.threadAccount?.accountId &&
-      !permission.allowed
-    );
-    autoInput.disabled = ownershipKnownAndDenied;
-    autoInput.checked = ownershipKnownAndDenied ? false : Boolean(state.autoMode);
-    autoInput.title = ownershipKnownAndDenied ? permission.reason : "";
-    autoRow?.classList.toggle("is-disabled", ownershipKnownAndDenied);
+    const unavailable = Boolean(state.authStatus.authenticated && !analysis.allowed);
+    autoInput.disabled = unavailable;
+    autoInput.checked = unavailable ? false : Boolean(state.autoMode);
+    autoInput.title = unavailable ? analysis.reason : "Analyze new replies automatically. Non-owned posts are not stored.";
+    autoRow?.classList.toggle("is-disabled", unavailable);
   }
 }
 
 function ensureViewerOwnsCurrentPost() {
-  const permission = getThreadSendPermission();
-  if (permission.allowed) return true;
-  setStatus(permission.reason);
-  document.getElementById("welivedit-panel")?.classList.add("open");
-  updateSendPermissionsUi();
-  return false;
+  // Ownership no longer blocks analysis. This helper now reports whether the
+  // current run is eligible for persistence only.
+  return getThreadStoragePermission().allowed;
 }
 
 function locationThreadStatusId() {
@@ -866,18 +904,12 @@ function scanVisibleReplies({ render = true, hide = true } = {}) {
 }
 
 function getSelectedThreadContext() {
-  const threadStatusId = currentThreadStatusId();
-  const contextMatchesThread = Boolean(
-    threadStatusId &&
-    state.originalPost?.x_id === threadStatusId &&
-    state.threadOwnerLock?.threadStatusId === threadStatusId &&
-    normalizedUsername(state.originalPost?.author_username) === state.threadOwnerLock?.normalizedUsername &&
-    state.threadAccount?.postId === threadStatusId &&
-    state.threadAccount?.linkedToCommunity
-  );
+  const storage = getThreadStoragePermission();
   return {
     communityId: state.communityId || null,
-    accountId: contextMatchesThread ? state.threadAccount?.accountId || null : null,
+    accountId: storage.allowed ? storage.accountId : null,
+    storeInDb: Boolean(storage.allowed),
+    storageReason: storage.allowed ? "owned_linked_x_post" : (storage.reason || "analysis_only"),
   };
 }
 
@@ -890,6 +922,9 @@ function buildPayload(items, originalOverride = null) {
   return {
     community_id: selectedContext.communityId,
     account_id: selectedContext.accountId,
+    store_in_db: selectedContext.storeInDb,
+    analysis_only: !selectedContext.storeInDb,
+    storage_reason: selectedContext.storageReason,
     platform: "x",
     ...SOURCE_META,
     ingestion_method: state.autoMode ? "automatic_extension_item_detection" : "manual_extension_item_send",
@@ -920,7 +955,6 @@ function buildPayload(items, originalOverride = null) {
     })),
   };
 }
-
 
 function emptyThreadAccount(overrides = {}) {
   return {
@@ -1090,23 +1124,19 @@ async function ensureThreadContextReady() {
     ? state.originalPost
     : detectedOriginal;
   if (!threadStatusId || !isOriginalForCurrentThread(original) || !original?.author_username) {
-    setStatus("Open the original X post (or scroll to its top once) so its account can be identified.");
+    setStatus("Open the original X post (or scroll to its top once) before analyzing replies.");
     return false;
   }
 
   state.originalPost = original;
-  const account = await refreshThreadAccount(original);
-  if (!account?.accountId) {
-    const detail = account?.error ? ` ${account.error}` : "";
-    setStatus(`The original post account has not been identified yet.${detail}`);
-    renderPanel();
-    return false;
-  }
-  if (!account.linkedToCommunity) {
-    setStatus("This post owner is not a monitored account in the selected community. The viewer's account will not be used as a fallback.");
-    renderPanel();
-    return false;
-  }
+
+  // Account lookup is useful for display and cross-checking, but it must not
+  // block analysis. A post may be analyzed even when its owner is not a stored
+  // community account. Persistence is decided separately from the viewer's
+  // authenticated linked accounts.
+  refreshThreadAccount(original).catch((error) => {
+    console.info("[WeLivedIt] account lookup did not block analysis", String(error?.message || error));
+  });
 
   return true;
 }
@@ -1164,7 +1194,7 @@ function renderThreadAccount() {
     return;
   }
   if (account.linkedToCommunity) {
-    statusEl.textContent = `Configured for ${state.communityId}${account.accountId ? ` · DB ${account.accountId}` : ""}. Comments will be linked to this post owner.`;
+    statusEl.textContent = `Configured for ${state.communityId}${account.accountId ? ` · DB ${account.accountId}` : ""}. Analysis is available; storage is enabled only for your own linked X posts.`;
     statusEl.classList.add("ok");
     saveButton.hidden = true;
     return;
@@ -1370,7 +1400,30 @@ function chunkItems(items, size) {
 
 async function resolveItemsInBatches(items) {
   const pending = items.filter((item) => item && !item.classified && !item.resolveDone && !state.inFlight.has(item.client_key));
-  if (!pending.length) return { attempted: 0, classified: 0, failed: false };
+  if (!pending.length) return { attempted: 0, classified: 0, failed: false, skippedForAnalysisOnly: false };
+
+  // IMPORTANT: /resolve is a persistence-aware path. The extension itself
+  // validates ownership before calling it. For a post that is not owned by
+  // one of the authenticated user's linked X accounts, do NOT call /resolve
+  // at all. Mark the items ready for direct analysis instead.
+  const storagePermission = getThreadStoragePermission();
+  if (!storagePermission.allowed) {
+    for (const item of pending) {
+      item.resolveDone = true;
+      item.status = "queued_analyze";
+      item.lastError = null;
+      updateArticleMark(item);
+      if (!item.manualRevealed) applyHidden(item.client_key, true, coverLabelForItem(item));
+    }
+    renderPanel();
+    logCheckStep("extension ownership validation: skip resolve", {
+      postId: state.originalPost?.x_id || null,
+      postOwner: state.originalPost?.author_username || null,
+      reason: storagePermission.reason || "not_owned",
+      comments: pending.length,
+    });
+    return { attempted: 0, classified: 0, failed: false, skippedForAnalysisOnly: true };
+  }
 
   const generation = state.generation;
   let classified = 0;
@@ -1437,21 +1490,39 @@ async function processSingleItem(item, { manual = false } = {}) {
     if (item.autoBlocked && !manual) return;
 
     if (!item.resolveDone) {
-      item.status = "resolving";
-      updateArticleMark(item);
-      if (!item.manualRevealed) applyHidden(key, true, coverLabelForItem(item));
-      renderPanel();
-      const resolved = await apiPost("/api/extension/x-comments/resolve", { ...buildPayload([item]), model: state.model });
-      applySingleResponseToItem(item, resolved);
-      item.resolveDone = true;
-      if (item.classified) {
-        item.status = String(item.status || "cached").includes("analyzed") ? "analyzed" : "cached";
-        rememberItem(item, { blocked: false, resolve_status: "classified" });
+      // Re-check ownership immediately before a persistence-capable request.
+      // Ownership can change when navigating between threads, so this check
+      // must happen at send time as well as when the queue is created.
+      const storagePermission = getThreadStoragePermission();
+      if (storagePermission.allowed) {
+        item.status = "resolving";
         updateArticleMark(item);
-        return;
+        if (!item.manualRevealed) applyHidden(key, true, coverLabelForItem(item));
+        renderPanel();
+        const resolved = await apiPost("/api/extension/x-comments/resolve", { ...buildPayload([item]), model: state.model });
+        applySingleResponseToItem(item, resolved);
+        item.resolveDone = true;
+        if (item.classified) {
+          item.status = String(item.status || "cached").includes("analyzed") ? "analyzed" : "cached";
+          rememberItem(item, { blocked: false, resolve_status: "classified" });
+          updateArticleMark(item);
+          return;
+        }
+        item.status = "missing";
+        rememberItem(item, { blocked: false, resolve_status: "missing", classification: null });
+      } else {
+        // Non-owned post: validation is performed in the extension and the
+        // persistence path is never called. Continue directly to /analyze
+        // with store_in_db=false so the reply is still classified.
+        item.resolveDone = true;
+        item.status = "queued_analyze";
+        logCheckStep("extension ownership validation: direct analysis", {
+          clientKey: item.client_key,
+          postId: state.originalPost?.x_id || null,
+          postOwner: state.originalPost?.author_username || null,
+          reason: storagePermission.reason || "not_owned",
+        });
       }
-      item.status = "missing";
-      rememberItem(item, { blocked: false, resolve_status: "missing", classification: null });
     }
 
     item.status = "analyzing";
@@ -1523,9 +1594,12 @@ async function enqueueUnprocessedItems({ manual = false } = {}) {
     if (manual) state.pendingManualSend = true;
     return 0;
   }
+  // Refresh the authenticated profile before deciding whether this thread
+  // may be persisted. The auth service response is cached in background.js,
+  // so this is cheap while keeping ownership validation in the extension.
+  await refreshAuthStatus(false);
   scanVisibleReplies({ render: false, hide: true });
   if (!(await ensureThreadContextReady())) return 0;
-  if (!ensureViewerOwnsCurrentPost()) return 0;
   const items = [...state.items.values()].sort((a, b) => (a.dom_order ?? Number.MAX_SAFE_INTEGER) - (b.dom_order ?? Number.MAX_SAFE_INTEGER));
   const candidates = items.filter((item) => (
     !item.classified &&
@@ -1543,7 +1617,11 @@ async function enqueueUnprocessedItems({ manual = false } = {}) {
 
   const cached = resolveSummary.classified;
   if (cached || queued) {
-    setStatus(`${cached ? `${cached} cached · ` : ""}${queued} queued for analysis · up to ${MAX_CONCURRENT_ITEM_JOBS} active.`);
+    const storagePermission = getThreadStoragePermission();
+    const modeLabel = storagePermission.allowed
+      ? "owned post: DB storage enabled"
+      : "not your post: analyzed only, no DB store request sent";
+    setStatus(`${cached ? `${cached} cached · ` : ""}${queued} queued for analysis · ${modeLabel}.`);
   } else {
     setStatus("No new replies to check.");
   }
@@ -1560,11 +1638,11 @@ function scheduleAutoEnqueue() {
 
 async function onAutoModeChanged(event) {
   const requested = Boolean(event?.target?.checked);
-  if (requested && state.authStatus.authenticated && !getThreadSendPermission().allowed) {
+  if (requested && state.authStatus.authenticated && !getThreadAnalysisPermission().allowed) {
     state.autoMode = false;
     if (event?.target) event.target.checked = false;
     await storageSet({ [STORAGE_KEYS.autoMode]: false });
-    setStatus(getThreadSendPermission().reason);
+    setStatus(getThreadAnalysisPermission().reason);
     renderPanel();
     return;
   }
@@ -1583,7 +1661,6 @@ async function retryItem(clientKey) {
     return;
   }
   if (!(await ensureThreadContextReady())) return;
-  if (!ensureViewerOwnsCurrentPost()) return;
   enqueueItem(item, { manual: true });
   setStatus("Retry queued.");
   renderPanel();
@@ -1686,15 +1763,31 @@ async function sendVisibleToCommunity({ triggeredByLogin = false } = {}) {
 
 
 async function apiPost(path, body) {
-  if (
-    path === "/api/extension/x-comments/resolve" ||
-    path === "/api/extension/x-comments/analyze"
-  ) {
-    const permission = getThreadSendPermission();
-    if (!permission.allowed) {
-      throw new Error(permission.reason || "This post is not owned by your linked X account.");
+  // Client-side persistence guard. /resolve is never sent for a non-owned
+  // original post. This is intentional business logic in the extension; the
+  // backend remains a second line of defense.
+  if (path === "/api/extension/x-comments/resolve") {
+    const storagePermission = getThreadStoragePermission();
+    if (!storagePermission.allowed) {
+      throw new Error(`Persistence request blocked by extension: ${storagePermission.reason || "post is not owned by the signed-in user's linked X account"}`);
     }
   }
+
+  if (path === "/api/extension/x-comments/analyze" && body?.store_in_db !== true) {
+    // Normalize analysis-only payloads so account_id can never accidentally
+    // be interpreted as a persistence target.
+    body = {
+      ...body,
+      account_id: null,
+      store_in_db: false,
+      analysis_only: true,
+      original_post: body?.original_post ? { ...body.original_post, account_id: null } : null,
+      comments: Array.isArray(body?.comments)
+        ? body.comments.map((comment) => ({ ...comment, account_id: null }))
+        : body?.comments,
+    };
+  }
+
   const url = `${state.apiBaseUrl}${path}`;
   logCheckStep("apiPost through background", {
     path,
@@ -1702,6 +1795,8 @@ async function apiPost(path, body) {
     bodyComments: Array.isArray(body?.comments) ? body.comments.length : null,
     communityId: body?.community_id || null,
     accountId: body?.account_id || null,
+    storeInDb: body?.store_in_db === true,
+    analysisOnly: body?.analysis_only === true,
   });
 
   const proxyResponse = await runtimeMessage({
