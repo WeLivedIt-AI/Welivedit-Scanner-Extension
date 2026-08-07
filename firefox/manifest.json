@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "WeliveditAi X Scanner",
-  "version": "5.2.1",
-  "description": "WeLivedIt X helper: analyze any post, store only replies from the authenticated user’s own linked X posts, with owner lock, focus/re-hide controls, and comment-climate emojis.",
+  "version": "5.2.2",
+  "description": "WeLivedIt X helper: analyze any post; store replies only when the original post account is monitored by the selected community, with owner lock, focus/re-hide controls, and comment-climate emojis.",
   "permissions": [
     "storage",
     "https://x.com/*",

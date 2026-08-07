@@ -1,5 +1,5 @@
 
-console.info("[WeLivedIt Chrome v5.2.1] content.js loaded", {
+console.info("[WeLivedIt Chrome v5.2.2] content.js loaded", {
   href: location.href,
   readyState: document.readyState,
   origin: location.origin,
@@ -14,6 +14,7 @@ window.__weliveditChromeV504Loaded = true;
 window.__weliveditChromeV511Loaded = true;
 window.__weliveditChromeV512Loaded = true;
 window.__weliveditChromeV521Loaded = true;
+window.__weliveditChromeV522Loaded = true;
 
 const DEFAULT_API_BASE_URL = globalThis.WELIVEDIT_CONFIG?.API_BASE_URL || "https://welivedit-ai-servicev2-production.up.railway.app";
 const DEFAULT_AUTH_BASE_URL = globalThis.WELIVEDIT_CONFIG?.AUTH_BASE_URL || "https://welivedit-service-server-production-7991.up.railway.app";
@@ -519,19 +520,20 @@ function accountBelongsToSelectedCommunity(account) {
 }
 
 function viewerLinkedAccountForOriginalPost() {
+  // Kept only for diagnostics/UI. Persistence is NOT gated by equality with
+  // the viewer's account_id anymore. The monitored community is the boundary.
   const originalUsername = normalizedUsername(state.originalPost?.author_username);
   const resolvedAccountId = normalizeAccountId(state.threadAccount?.accountId);
   const linkedAccounts = state.viewerIdentity?.linkedAccounts || [];
 
   return linkedAccounts.find((account) => {
     if (account?.platform && String(account.platform).toLowerCase() !== "x") return false;
-    if (!accountBelongsToSelectedCommunity(account)) return false;
-
     const accountId = normalizeAccountId(account?.accountId);
     const username = normalizedUsername(account?.username);
-    const idMatches = Boolean(resolvedAccountId && accountId && resolvedAccountId === accountId);
-    const usernameMatches = Boolean(originalUsername && username && originalUsername === username);
-    return idMatches || usernameMatches;
+    return Boolean(
+      (resolvedAccountId && accountId && resolvedAccountId === accountId) ||
+      (originalUsername && username && originalUsername === username)
+    );
   }) || null;
 }
 
@@ -553,24 +555,31 @@ function getThreadStoragePermission() {
   const analysis = getThreadAnalysisPermission();
   if (!analysis.allowed) return { allowed: false, reason: analysis.reason };
 
-  const viewerAccount = viewerLinkedAccountForOriginalPost();
-  if (!viewerAccount?.accountId) {
+  const account = state.threadAccount || {};
+  if (account.loading) {
     return {
       allowed: false,
-      reason: "This is not one of your linked X posts. Replies will be analyzed without being stored.",
+      reason: "Checking whether the original post account belongs to the selected community.",
     };
   }
 
-  const resolvedAccountId = normalizeAccountId(state.threadAccount?.accountId);
-  const viewerAccountId = normalizeAccountId(viewerAccount.accountId);
-  if (resolvedAccountId && resolvedAccountId !== viewerAccountId) {
+  // Community membership is the persistence boundary. The original post does
+  // NOT need to belong to the signed-in viewer. It can belong to any monitored
+  // X account registered in the selected community, including monitored
+  // accounts whose owners do not have a WeLivedIt platform user.
+  if (account.linkedToCommunity && account.accountId) {
     return {
-      allowed: false,
-      reason: "The detected post owner does not match your linked X account. Replies will not be stored.",
+      allowed: true,
+      accountId: account.accountId,
+      communityAccount: account,
+      viewerOwnsPost: Boolean(viewerLinkedAccountForOriginalPost()),
     };
   }
 
-  return { allowed: true, viewerAccount, accountId: viewerAccount.accountId };
+  return {
+    allowed: false,
+    reason: `@${state.originalPost?.author_username || "this account"} is not registered in ${state.communityId}. Replies will be analyzed without being stored.`,
+  };
 }
 
 function getThreadSendPermission() {
@@ -598,7 +607,7 @@ function updateSendPermissionsUi() {
     } else if (storage.allowed) {
       sendButton.disabled = false;
       sendButton.textContent = "Analyze & save replies";
-      sendButton.title = "This is your linked X post. Results and replies may be stored.";
+      sendButton.title = "This post belongs to an X account monitored by the selected community. Results and replies may be stored.";
     } else {
       sendButton.disabled = false;
       sendButton.textContent = "Analyze replies (not saved)";
@@ -610,14 +619,14 @@ function updateSendPermissionsUi() {
     const unavailable = Boolean(state.authStatus.authenticated && !analysis.allowed);
     autoInput.disabled = unavailable;
     autoInput.checked = unavailable ? false : Boolean(state.autoMode);
-    autoInput.title = unavailable ? analysis.reason : "Analyze new replies automatically. Non-owned posts are not stored.";
+    autoInput.title = unavailable ? analysis.reason : "Analyze new replies automatically. Posts outside the selected community are not stored.";
     autoRow?.classList.toggle("is-disabled", unavailable);
   }
 }
 
 function ensureViewerOwnsCurrentPost() {
-  // Ownership no longer blocks analysis. This helper now reports whether the
-  // current run is eligible for persistence only.
+  // Community membership does not block analysis. This helper reports whether
+  // the current thread is eligible for persistence only.
   return getThreadStoragePermission().allowed;
 }
 
@@ -912,7 +921,7 @@ function getSelectedThreadContext() {
     communityId: state.communityId || null,
     accountId: storage.allowed ? storage.accountId : null,
     storeInDb: Boolean(storage.allowed),
-    storageReason: storage.allowed ? "owned_linked_x_post" : (storage.reason || "analysis_only"),
+    storageReason: storage.allowed ? "account_linked_to_selected_community" : (storage.reason || "analysis_only"),
   };
 }
 
@@ -1133,13 +1142,13 @@ async function ensureThreadContextReady() {
 
   state.originalPost = original;
 
-  // Account lookup is useful for display and cross-checking, but it must not
-  // block analysis. A post may be analyzed even when its owner is not a stored
-  // community account. Persistence is decided separately from the viewer's
-  // authenticated linked accounts.
-  refreshThreadAccount(original).catch((error) => {
-    console.info("[WeLivedIt] account lookup did not block analysis", String(error?.message || error));
-  });
+  // Resolve the original post account before deciding persistence. Failure does
+  // not block classification; it simply makes this run analysis-only.
+  try {
+    await refreshThreadAccount(original);
+  } catch (error) {
+    console.info("[WeLivedIt] community account lookup failed; continuing analysis-only", String(error?.message || error));
+  }
 
   return true;
 }
@@ -1197,7 +1206,7 @@ function renderThreadAccount() {
     return;
   }
   if (account.linkedToCommunity) {
-    statusEl.textContent = `Configured for ${state.communityId}${account.accountId ? ` · DB ${account.accountId}` : ""}. Analysis is available; storage is enabled only for your own linked X posts.`;
+    statusEl.textContent = `Configured for ${state.communityId}${account.accountId ? ` · DB ${account.accountId}` : ""}. Analysis is available; storage is enabled because this account is monitored by the selected community.`;
     statusEl.classList.add("ok");
     saveButton.hidden = true;
     return;
@@ -1406,8 +1415,8 @@ async function resolveItemsInBatches(items) {
   if (!pending.length) return { attempted: 0, classified: 0, failed: false, skippedForAnalysisOnly: false };
 
   // IMPORTANT: /resolve is a persistence-aware path. The extension itself
-  // validates ownership before calling it. For a post that is not owned by
-  // one of the authenticated user's linked X accounts, do NOT call /resolve
+  // validates community membership before calling it. For a post whose owner is
+  // not registered in the selected community, do NOT call /resolve
   // at all. Mark the items ready for direct analysis instead.
   const storagePermission = getThreadStoragePermission();
   if (!storagePermission.allowed) {
@@ -1419,10 +1428,10 @@ async function resolveItemsInBatches(items) {
       if (!item.manualRevealed) applyHidden(item.client_key, true, coverLabelForItem(item));
     }
     renderPanel();
-    logCheckStep("extension ownership validation: skip resolve", {
+    logCheckStep("extension community validation: skip resolve", {
       postId: state.originalPost?.x_id || null,
       postOwner: state.originalPost?.author_username || null,
-      reason: storagePermission.reason || "not_owned",
+      reason: storagePermission.reason || "outside_community",
       comments: pending.length,
     });
     return { attempted: 0, classified: 0, failed: false, skippedForAnalysisOnly: true };
@@ -1493,8 +1502,8 @@ async function processSingleItem(item, { manual = false } = {}) {
     if (item.autoBlocked && !manual) return;
 
     if (!item.resolveDone) {
-      // Re-check ownership immediately before a persistence-capable request.
-      // Ownership can change when navigating between threads, so this check
+      // Re-check community membership immediately before a persistence-capable request.
+      // Thread context can change when navigating between posts, so this check
       // must happen at send time as well as when the queue is created.
       const storagePermission = getThreadStoragePermission();
       if (storagePermission.allowed) {
@@ -1514,16 +1523,16 @@ async function processSingleItem(item, { manual = false } = {}) {
         item.status = "missing";
         rememberItem(item, { blocked: false, resolve_status: "missing", classification: null });
       } else {
-        // Non-owned post: validation is performed in the extension and the
-        // persistence path is never called. Continue directly to /analyze
+        // Post outside the selected community: validation is performed in the
+        // extension and the persistence path is never called. Continue directly to /analyze
         // with store_in_db=false so the reply is still classified.
         item.resolveDone = true;
         item.status = "queued_analyze";
-        logCheckStep("extension ownership validation: direct analysis", {
+        logCheckStep("extension community validation: direct analysis", {
           clientKey: item.client_key,
           postId: state.originalPost?.x_id || null,
           postOwner: state.originalPost?.author_username || null,
-          reason: storagePermission.reason || "not_owned",
+          reason: storagePermission.reason || "outside_community",
         });
       }
     }
@@ -1598,9 +1607,8 @@ async function enqueueUnprocessedItems({ manual = false } = {}) {
     if (manual) state.pendingManualSend = true;
     return 0;
   }
-  // Refresh the authenticated profile before deciding whether this thread
-  // may be persisted. The auth service response is cached in background.js,
-  // so this is cheap while keeping ownership validation in the extension.
+  // Refresh auth state, then resolve the original post account against the
+  // selected community before deciding whether this thread may be persisted.
   await refreshAuthStatus(false);
   scanVisibleReplies({ render: false, hide: true });
   if (!(await ensureThreadContextReady())) return 0;
@@ -1623,8 +1631,8 @@ async function enqueueUnprocessedItems({ manual = false } = {}) {
   if (cached || queued) {
     const storagePermission = getThreadStoragePermission();
     const modeLabel = storagePermission.allowed
-      ? "owned post: DB storage enabled"
-      : "not your post: analyzed only, no DB store request sent";
+      ? "community-monitored post: DB storage enabled"
+      : "outside community: analyzed only, no DB store request sent";
     setStatus(`${cached ? `${cached} cached · ` : ""}${queued} queued for analysis · ${modeLabel}.`);
   } else {
     setStatus("No new replies to check.");
@@ -1794,13 +1802,13 @@ async function sendVisibleToCommunity({ triggeredByLogin = false } = {}) {
 
 
 async function apiPost(path, body) {
-  // Client-side persistence guard. /resolve is never sent for a non-owned
-  // original post. This is intentional business logic in the extension; the
+  // Client-side persistence guard. /resolve is never sent when the original
+  // post owner is outside the selected monitored community. This is business logic in the extension; the
   // backend remains a second line of defense.
   if (path === "/api/extension/x-comments/resolve") {
     const storagePermission = getThreadStoragePermission();
     if (!storagePermission.allowed) {
-      throw new Error(`Persistence request blocked by extension: ${storagePermission.reason || "post is not owned by the signed-in user's linked X account"}`);
+      throw new Error(`Persistence request blocked by extension: ${storagePermission.reason || "post owner is not registered in the selected community"}`);
     }
   }
 
