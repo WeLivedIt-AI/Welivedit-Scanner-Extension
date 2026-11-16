@@ -1,5 +1,5 @@
 
-console.info("[WeLivedIt Chrome v5.2.2] content.js loaded", {
+console.info("[WeLivedIt Chrome v5.2.3] content.js loaded", {
   href: location.href,
   readyState: document.readyState,
   origin: location.origin,
@@ -15,6 +15,7 @@ window.__weliveditChromeV511Loaded = true;
 window.__weliveditChromeV512Loaded = true;
 window.__weliveditChromeV521Loaded = true;
 window.__weliveditChromeV522Loaded = true;
+window.__weliveditChromeV523Loaded = true;
 
 const DEFAULT_API_BASE_URL = globalThis.WELIVEDIT_CONFIG?.API_BASE_URL || "https://welivedit-ai-servicev2-production.up.railway.app";
 const DEFAULT_AUTH_BASE_URL = globalThis.WELIVEDIT_CONFIG?.AUTH_BASE_URL || "https://welivedit-service-server-production-7991.up.railway.app";
@@ -55,6 +56,10 @@ const STORAGE_KEYS = {
   communityId: "welivedit_community_id",
   model: "welivedit_model",
   autoMode: "welivedit_auto_mode",
+  processingMode: "welivedit_processing_mode",
+  hideMedia: "welivedit_hide_media",
+  blockedWords: "welivedit_blocked_words",
+  onboardingComplete: "welivedit_onboarding_complete",
   seenRecords: "welivedit_seen_records_v1",
 };
 
@@ -65,6 +70,10 @@ const state = {
   model: DEFAULT_MODEL,
   authEnabled: DEFAULT_AUTH_ENABLED,
   autoMode: false,
+  processingMode: "local",
+  hideMedia: true,
+  blockedWords: [],
+  onboardingComplete: false,
   authStatus: { authenticated: false, email: null },
   // Identity of the person using WeLivedIt. This is authentication context only.
   // It must never be used as the target account for comments.
@@ -182,15 +191,32 @@ function cleanupExistingWeliveditUi() {
 async function initExtension() {
   cleanupExistingWeliveditUi();
   await loadSettings();
-  await refreshClassifierConfig();
+
+  console.log(
+    "[WeLivedIt] local classifier available:",
+    typeof globalThis.WELIVEDIT_HATEBERT,
+    globalThis.WELIVEDIT_HATEBERT
+  );
+
+  
+  if (state.authEnabled) {
+    await refreshClassifierConfig();
+  }
   await refreshAuthStatus(false);
   injectStyles();
   createFloatingButton();
   createPanel();
+  augmentProcessingControls();
+  makePanelCompact();
+  applyPanelLayoutFixes();
+  updateCompactPanelSummary();
   scanVisibleReplies({ render: true, hide: true });
   if (state.autoMode) scheduleAutoEnqueue();
   startNavigationWatcher();
   startThreadObserver();
+
+  maybeOpenFirstRunTour();
+
   console.info("[WeLivedIt] extension initialized", { url: location.href });
 }
 
@@ -220,6 +246,29 @@ async function loadSettings() {
   state.model = String(values[STORAGE_KEYS.model] || DEFAULT_MODEL);
   state.authEnabled = DEFAULT_AUTH_ENABLED;
   state.autoMode = parseBool(values[STORAGE_KEYS.autoMode], false);
+
+  const storedProcessingMode = String(
+    values[STORAGE_KEYS.processingMode] || "local"
+  ).toLowerCase();
+
+  state.processingMode =
+    storedProcessingMode === "online" ? "online" : "local";
+
+  state.hideMedia = parseBool(
+    values[STORAGE_KEYS.hideMedia],
+    true
+  );
+
+  state.blockedWords = Array.isArray(values[STORAGE_KEYS.blockedWords])
+    ? values[STORAGE_KEYS.blockedWords]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean)
+    : [];
+
+  state.onboardingComplete = parseBool(
+    values[STORAGE_KEYS.onboardingComplete],
+    false
+  );
   const records = values[STORAGE_KEYS.seenRecords];
   state.seenRecords = records && typeof records === "object" && !Array.isArray(records) ? records : {};
 
@@ -241,6 +290,114 @@ function parseBool(value, fallback = false) {
   if (["true", "1", "yes", "on"].includes(normalized)) return true;
   if (["false", "0", "no", "off"].includes(normalized)) return false;
   return fallback;
+}
+
+
+function normalizeProtectionText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+function blockedWordMatch(item) {
+  const message = normalizeProtectionText(item?.message);
+
+  if (!message || !Array.isArray(state.blockedWords)) {
+    return null;
+  }
+
+  for (const raw of state.blockedWords) {
+    const rule = normalizeProtectionText(raw);
+
+    if (!rule) continue;
+
+    if (message.includes(rule)) {
+      return raw;
+    }
+  }
+
+  return null;
+}
+
+
+function isHiddenByUserRule(item) {
+  return Boolean(blockedWordMatch(item));
+}
+
+
+function shouldProtectItem(item) {
+  if (!item) return false;
+
+  if (isHiddenByUserRule(item)) {
+    return true;
+  }
+
+  return Boolean(
+    item.classified &&
+    isHarmful(item.classification)
+  );
+}
+
+
+function protectionLabelForItem(item) {
+  const matched = blockedWordMatch(item);
+
+  if (matched) {
+    return "Message hidden by one of your protection rules.";
+  }
+
+  if (item?.classified && isHarmful(item.classification)) {
+    return "Message hidden. It may need care.";
+  }
+
+  return "Message hidden.";
+}
+
+
+function reapplyBlockedWordRules() {
+  for (const item of state.items.values()) {
+    if (!item) continue;
+
+    const matched = blockedWordMatch(item);
+
+    if (matched) {
+      item.manualRevealed = false;
+
+      applyHidden(
+        item.client_key,
+        true,
+        protectionLabelForItem(item),
+        { force: true }
+      );
+
+      continue;
+    }
+
+    // Removing a personal rule must not reveal model-harmful content.
+    if (
+      item.classified &&
+      isHarmful(item.classification)
+    ) {
+      applyHidden(
+        item.client_key,
+        true,
+        protectionLabelForItem(item),
+        { force: true }
+      );
+    } else if (!item.manualHidden) {
+      applyHidden(
+        item.client_key,
+        false,
+        "",
+        { manual: false }
+      );
+    }
+  }
+
+  renderPanel();
 }
 
 function normalizeBaseUrl(value) {
@@ -357,9 +514,20 @@ function createPanel() {
 
 function togglePanel() {
   const panel = document.getElementById("welivedit-panel");
+  const ball = document.getElementById("welivedit-ball");
   if (!panel) return;
+
   panel.classList.toggle("open");
-  if (panel.classList.contains("open")) refreshAuthStatus(true);
+
+  const isOpen = panel.classList.contains("open");
+
+  if (ball) {
+    ball.style.display = isOpen ? "none" : "flex";
+  }
+
+  if (isOpen) {
+    refreshAuthStatus(true);
+  }
 }
 
 function injectStyles() {
@@ -376,11 +544,1910 @@ function injectStyles() {
 .welivedit-climate{background:rgba(255,255,255,.84);border:1px solid #d8e2db;border-radius:10px;padding:9px 10px;margin:0 0 7px}.welivedit-climate-title{font-size:10px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#53606a;margin-bottom:6px}.welivedit-climate-grid{display:grid;grid-template-columns:1fr auto;gap:5px 10px;align-items:center}.welivedit-climate-label{font-size:10px;color:#65727d}.welivedit-climate-result{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-width:126px}.welivedit-climate-emoji{font-size:22px;line-height:1}.welivedit-climate-value{font-size:11px;font-weight:800;color:#26333f;text-align:right}.welivedit-climate-value small{display:block;font-size:9px;font-weight:500;color:#65727d;margin-top:1px}.welivedit-climate-impact{font-size:10px;color:#155b31;font-weight:700;margin-top:7px}.welivedit-climate-note{font-size:9px;color:#65727d;margin-top:5px;line-height:1.3}.welivedit-climate-empty{font-size:10px;color:#65727d}
 #welivedit-panel button,.welivedit-card button{border:0;border-radius:8px;background:#438951;color:#fff;cursor:pointer;font-weight:700}#welivedit-panel button:hover:not(:disabled),.welivedit-card button:hover:not(:disabled){filter:brightness(.95)}#welivedit-panel button:disabled,.welivedit-card button:disabled{cursor:not-allowed!important;opacity:.55!important;filter:none!important}.welivedit-status{font-size:11px;padding:6px 8px;background:rgba(255,255,255,.72);border-radius:8px;border:1px solid #d8e2db;margin-bottom:6px}.welivedit-summary{font-size:11px;color:#43505a;margin-bottom:7px}#welivedit-content{overflow-y:auto;padding-right:3px;min-height:0}.welivedit-card{background:#fff;border-radius:10px;padding:9px;margin-bottom:7px;box-shadow:0 3px 10px rgba(0,0,0,.06);border:1px solid #e3ece6}.welivedit-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:5px}.welivedit-card-author{font-size:11px;font-weight:700;color:#26333f;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.welivedit-card-text{font-size:12px;line-height:1.35;max-height:68px;overflow:auto;margin-bottom:6px;color:#26333f}.welivedit-card-placeholder{font-size:11px;line-height:1.35;color:#65727d;margin-bottom:6px}.welivedit-card-meta{display:flex;flex-wrap:wrap;gap:5px;align-items:center}.welivedit-badge{display:inline-block;border-radius:999px;padding:3px 7px;font-size:10px;font-weight:700;background:#eef2f7;color:#293744}.welivedit-badge.processing{background:#fff2cc;color:#745500}.welivedit-badge.harmful{background:#ffe2e2;color:#a31313}.welivedit-badge.supportive,.welivedit-badge.safe{background:#def7e7;color:#155b31}.welivedit-badge.error{background:#f6dfe3;color:#9c1c31}.welivedit-card-actions{display:flex;justify-content:flex-end;gap:5px;margin-top:6px}.welivedit-card-actions button{font-size:10px;padding:5px 7px}
 .welivedit-mark{position:absolute;top:4px;right:4px;z-index:2147483646;background:#65727d;color:#fff;font:700 10px Arial;border-radius:999px;padding:3px 6px;pointer-events:none;min-width:14px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.22)}.welivedit-mark.is-processing{background:#c58b00}.welivedit-mark.is-safe{background:#238846}.welivedit-mark.is-harmful{background:#ba2b3c}.welivedit-mark.is-error{background:#7a3340}.welivedit-mark.is-cached{background:#28758f}
-.welivedit-cover{display:none;position:absolute!important;inset:0!important;width:auto!important;height:auto!important;z-index:2147483645!important;box-sizing:border-box!important;margin:0!important;padding:10px 12px!important;border-radius:12px!important;background:#e8f5eb!important;color:#183925!important;border:1px solid #b8d8c1!important;font:700 12px Arial,sans-serif!important;align-items:center!important;justify-content:center!important;flex-direction:column!important;text-align:center!important;box-shadow:0 4px 18px rgba(0,0,0,.10)!important;pointer-events:auto!important;overflow:hidden!important}.welivedit-cover.is-visible{display:flex!important}.welivedit-cover.is-rehide{display:flex!important;inset:auto 8px 8px auto!important;width:auto!important;height:auto!important;padding:0!important;background:transparent!important;border:0!important;box-shadow:none!important;align-items:center!important;justify-content:center!important;overflow:visible!important}.welivedit-cover.is-rehide button{margin:0!important;background:#17212b!important;box-shadow:0 3px 10px rgba(0,0,0,.24)!important}.welivedit-cover button{margin-top:6px;background:#438951!important;color:#fff!important;border:0!important;border-radius:8px!important;padding:5px 9px!important;font:700 11px Arial!important;cursor:pointer!important;pointer-events:auto!important}.welivedit-hard-hidden{position:relative!important}.welivedit-redacted-shell{visibility:hidden!important;opacity:0!important;filter:none!important;pointer-events:none!important;user-select:none!important;-webkit-user-select:none!important}.welivedit-redacted-shell *{visibility:hidden!important;opacity:0!important;filter:none!important;pointer-events:none!important;user-select:none!important;-webkit-user-select:none!important}.welivedit-empty{font-size:11px;line-height:1.4;color:#53606a;background:rgba(255,255,255,.55);padding:9px;border-radius:9px}.welivedit-focus-highlight{outline:4px solid #438951!important;outline-offset:4px!important;border-radius:12px!important;animation:welivedit-focus-pulse .7s ease-in-out 3!important}@keyframes welivedit-focus-pulse{0%,100%{outline-width:4px;box-shadow:0 0 0 0 rgba(67,137,81,.15)}50%{outline-width:6px;box-shadow:0 0 0 10px rgba(67,137,81,.12)}}
+.welivedit-cover{display:none;position:relative!important;inset:auto!important;width:100%!important;height:auto!important;z-index:2147483645!important;box-sizing:border-box!important;margin:4px 0!important;padding:10px 12px!important;border-radius:12px!important;background:#e8f5eb!important;color:#183925!important;border:1px solid #b8d8c1!important;font:700 12px Arial,sans-serif!important;align-items:center!important;justify-content:center!important;flex-direction:column!important;text-align:center!important;box-shadow:0 4px 18px rgba(0,0,0,.10)!important;pointer-events:auto!important;overflow:hidden!important}.welivedit-cover.is-visible{display:flex!important}.welivedit-cover.is-rehide{display:flex!important;inset:auto 8px 8px auto!important;width:auto!important;height:auto!important;padding:0!important;background:transparent!important;border:0!important;box-shadow:none!important;align-items:center!important;justify-content:center!important;overflow:visible!important}.welivedit-cover.is-rehide button{margin:0!important;background:#17212b!important;box-shadow:0 3px 10px rgba(0,0,0,.24)!important}.welivedit-cover button{margin-top:6px;background:#438951!important;color:#fff!important;border:0!important;border-radius:8px!important;padding:5px 9px!important;font:700 11px Arial!important;cursor:pointer!important;pointer-events:auto!important}.welivedit-hard-hidden{position:relative!important}.welivedit-redacted-shell{visibility:hidden!important;opacity:0!important;filter:none!important;pointer-events:none!important;user-select:none!important;-webkit-user-select:none!important}.welivedit-redacted-shell *{visibility:hidden!important;opacity:0!important;filter:none!important;pointer-events:none!important;user-select:none!important;-webkit-user-select:none!important}.welivedit-empty{font-size:11px;line-height:1.4;color:#53606a;background:rgba(255,255,255,.55);padding:9px;border-radius:9px}.welivedit-focus-highlight{outline:4px solid #438951!important;outline-offset:4px!important;border-radius:12px!important;animation:welivedit-focus-pulse .7s ease-in-out 3!important}@keyframes welivedit-focus-pulse{0%,100%{outline-width:4px;box-shadow:0 0 0 0 rgba(67,137,81,.15)}50%{outline-width:6px;box-shadow:0 0 0 10px rgba(67,137,81,.12)}}
 @media (max-width:480px){#welivedit-panel{width:100vw;padding:11px}#welivedit-ball{right:9px;width:49px;height:49px}.welivedit-auth-form{grid-template-columns:1fr}.welivedit-auth-form button{width:100%}}
   `;
   document.head.appendChild(style);
 }
+
+
+function augmentProcessingControls() {
+  const panel = document.getElementById("welivedit-panel");
+  if (!panel || document.getElementById("welivedit-processing-controls")) return;
+
+  const box = document.createElement("div");
+  box.id = "welivedit-processing-controls";
+  box.style.cssText = `
+    margin:10px 0;
+    padding:10px;
+    border:1px solid rgba(0,0,0,.12);
+    border-radius:10px;
+    font:12px Arial,sans-serif;
+  `;
+
+  box.innerHTML = `
+    <div style="font-weight:700;margin-bottom:7px">Processing</div>
+
+    <label style="display:block;margin:5px 0">
+      <input
+        type="radio"
+        name="welivedit-processing-mode"
+        value="local"
+        ${state.processingMode === "local" ? "checked" : ""}
+      >
+      On this device
+    </label>
+
+    <label style="display:block;margin:5px 0">
+      <input
+        type="radio"
+        name="welivedit-processing-mode"
+        value="online"
+        ${state.processingMode === "online" ? "checked" : ""}
+      >
+      Online on WeLivedIt servers
+    </label>
+
+    <div style="font-weight:700;margin:10px 0 5px">Media</div>
+
+    <label style="display:block;margin:5px 0">
+      <input
+        id="welivedit-hide-media"
+        type="checkbox"
+        ${state.hideMedia ? "checked" : ""}
+      >
+      Hide images/videos in screened replies
+    </label>
+
+    <div style="font-size:10px;opacity:.7;margin-top:7px">
+      Image hiding is exposure control only. Images are not analyzed yet.
+    </div>
+  `;
+
+  const firstChild = panel.children[1] || null;
+  panel.insertBefore(box, firstChild);
+
+  box.querySelectorAll('input[name="welivedit-processing-mode"]').forEach((input) => {
+    input.addEventListener("change", async () => {
+      if (!input.checked) return;
+
+      state.processingMode = input.value === "online" ? "online" : "local";
+
+      await storageSet({
+        [STORAGE_KEYS.processingMode]: state.processingMode,
+      });
+
+      state.classifierCacheKey =
+        state.processingMode === "local"
+          ? "local_hatebert_q8_0.51"
+          : `${state.apiBaseUrl}|${state.model}`;
+
+      setStatus(
+        state.processingMode === "local"
+          ? "Processing locally on this device."
+          : "Processing online with WeLivedIt."
+      );
+    });
+  });
+
+  const hideMedia = box.querySelector("#welivedit-hide-media");
+
+  hideMedia?.addEventListener("change", async () => {
+    state.hideMedia = Boolean(hideMedia.checked);
+
+    await storageSet({
+      [STORAGE_KEYS.hideMedia]: state.hideMedia,
+    });
+
+    // Reapply current visibility so media follows the setting immediately.
+    for (const item of state.items.values()) {
+      if (!item.classified || item.manualRevealed) continue;
+
+      const hidden = isHarmful(item.classification);
+      applyHidden(
+        item.client_key,
+        hidden,
+        hidden ? "Message hidden. It may need care." : "",
+        { force: true }
+      );
+    }
+  });
+}
+
+
+function makePanelCompact() {
+  const panel = document.getElementById("welivedit-panel");
+  if (!panel) return;
+
+  const header = panel.querySelector(".welivedit-header");
+
+  // ----------------------------------------------------------
+  // Header: title + settings gear + close
+  // ----------------------------------------------------------
+
+  if (!document.getElementById("welivedit-settings-button")) {
+    const close = document.getElementById("welivedit-close");
+
+    const actions = document.createElement("div");
+    actions.id = "welivedit-header-actions";
+
+    const settings = document.createElement("button");
+    settings.id = "welivedit-settings-button";
+    settings.type = "button";
+    settings.setAttribute("aria-label", "Open WeLivedIt settings");
+    settings.title = "Settings";
+    settings.textContent = "⚙";
+
+    actions.appendChild(settings);
+
+    if (close?.parentElement) {
+      close.parentElement.removeChild(close);
+      actions.appendChild(close);
+    }
+
+    header?.appendChild(actions);
+
+    settings.addEventListener("click", openSettingsModal);
+  }
+
+  // ----------------------------------------------------------
+  // Compact status
+  // ----------------------------------------------------------
+
+  let compact = document.getElementById("welivedit-compact-summary");
+
+  if (!compact) {
+    compact = document.createElement("div");
+    compact.id = "welivedit-compact-summary";
+
+    compact.innerHTML = `
+      <span id="welivedit-compact-status">Protection active</span>
+    `;
+
+    header?.insertAdjacentElement("afterend", compact);
+  }
+
+  // ----------------------------------------------------------
+  // Quick privacy explanation
+  // ----------------------------------------------------------
+
+  if (!document.getElementById("welivedit-data-note")) {
+    const note = document.createElement("div");
+    note.id = "welivedit-data-note";
+
+    note.innerHTML = `
+      <div>
+        <strong>Your data, your choice.</strong>
+        Local protection can work without signing in.
+      </div>
+      <button id="welivedit-data-settings-shortcut" type="button">
+        How we use data
+      </button>
+    `;
+
+    compact.insertAdjacentElement("afterend", note);
+
+    document
+      .getElementById("welivedit-data-settings-shortcut")
+      ?.addEventListener("click", openSettingsModal);
+  }
+
+  // ----------------------------------------------------------
+  // Quick blocked-words shortcut — functionality comes next
+  // ----------------------------------------------------------
+
+  if (!document.getElementById("welivedit-blocked-words-shortcut")) {
+    const words = document.createElement("button");
+    words.id = "welivedit-blocked-words-shortcut";
+    words.type = "button";
+    words.innerHTML = `🛡 <span>Always hide words or phrases…</span>`;
+
+    const send = document.getElementById("welivedit-send");
+
+    if (send?.parentElement) {
+      send.parentElement.insertBefore(words, send);
+    }
+
+    words.addEventListener(
+      "click",
+      openBlockedWordsModal
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Create settings modal and move configuration into it
+  // ----------------------------------------------------------
+
+  ensureSettingsModal();
+
+  updateCompactPanelSummary();
+}
+function updateCompactPanelSummary() {
+  const el = document.getElementById("welivedit-compact-status");
+  if (!el) return;
+
+  const items = [...state.items.values()];
+  const classified = items.filter((item) => item.classified);
+
+  const harmful = classified.filter(
+    (item) => isHarmful(item.classification)
+  );
+
+  const hidden = classified.filter(
+    (item) => item.hidden
+  );
+
+  const waiting = items.filter(
+    (item) => !item.classified
+  );
+
+  const mode =
+    state.processingMode === "local"
+      ? "Local"
+      : "Online";
+
+  el.textContent =
+    `${mode} · ${classified.length} checked · ` +
+    `${hidden.length} hidden · ${waiting.length} waiting`;
+}
+
+
+function applyPanelLayoutFixes() {
+  if (document.getElementById("welivedit-layout-fixes")) return;
+
+  const style = document.createElement("style");
+  style.id = "welivedit-layout-fixes";
+
+  style.textContent = `
+
+    /* ========================================================
+       MAIN PANEL
+       ======================================================== */
+
+    #welivedit-panel {
+      overflow: hidden !important;
+      display: flex !important;
+      flex-direction: column !important;
+      position: fixed !important;
+    }
+
+    .welivedit-header {
+      flex: 0 0 auto !important;
+      align-items: flex-start !important;
+    }
+
+    #welivedit-header-actions {
+      display: flex !important;
+      align-items: center !important;
+      gap: 3px !important;
+    }
+
+    #welivedit-settings-button {
+      border: 0 !important;
+      background: transparent !important;
+      color: #26333f !important;
+      font-size: 20px !important;
+      line-height: 1 !important;
+      width: 30px !important;
+      height: 30px !important;
+      padding: 0 !important;
+      border-radius: 50% !important;
+    }
+
+    #welivedit-settings-button:hover {
+      background: rgba(67,137,81,.12) !important;
+    }
+
+    #welivedit-close {
+      width: 30px !important;
+      height: 30px !important;
+    }
+
+
+    #welivedit-compact-summary {
+      flex: 0 0 auto !important;
+      display: flex !important;
+      align-items: center !important;
+
+      padding: 8px 10px !important;
+      margin: 4px 0 6px !important;
+
+      background: #dceee1 !important;
+      border: 1px solid #b5d4be !important;
+      border-radius: 9px !important;
+
+      color: #24402d !important;
+      font: 700 11px Arial,sans-serif !important;
+    }
+
+
+    #welivedit-data-note {
+      flex: 0 0 auto !important;
+
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      gap: 8px !important;
+
+      padding: 7px 9px !important;
+      margin-bottom: 6px !important;
+
+      border: 1px solid #d4e1d7 !important;
+      border-radius: 9px !important;
+
+      background: rgba(255,255,255,.68) !important;
+
+      color: #53606a !important;
+      font: 10px/1.35 Arial,sans-serif !important;
+    }
+
+    #welivedit-data-note strong {
+      display: block !important;
+      color: #26333f !important;
+      margin-bottom: 1px !important;
+    }
+
+    #welivedit-data-settings-shortcut {
+      flex: 0 0 auto !important;
+
+      background: transparent !important;
+      color: #337345 !important;
+
+      padding: 4px 5px !important;
+
+      font-size: 9px !important;
+      white-space: nowrap !important;
+    }
+
+
+    #welivedit-blocked-words-shortcut {
+      flex: 0 0 auto !important;
+
+      width: 100% !important;
+      text-align: left !important;
+
+      background: #f4f8f5 !important;
+      color: #294936 !important;
+
+      border: 1px solid #ceddd2 !important;
+      padding: 8px 10px !important;
+      margin: 0 0 6px !important;
+
+      font-size: 11px !important;
+    }
+
+
+    #welivedit-send,
+    #welivedit-status,
+    #welivedit-climate,
+    #welivedit-summary {
+      flex: 0 0 auto !important;
+    }
+
+
+    #welivedit-content {
+      flex: 1 1 0 !important;
+      min-height: 0 !important;
+      height: 0 !important;
+
+      overflow-y: auto !important;
+      overflow-x: hidden !important;
+
+      overscroll-behavior: contain !important;
+      touch-action: pan-y !important;
+
+      padding-right: 5px !important;
+      padding-bottom: 30px !important;
+    }
+
+    #welivedit-content::-webkit-scrollbar {
+      width: 8px !important;
+    }
+
+    #welivedit-content::-webkit-scrollbar-thumb {
+      background: rgba(67,93,74,.40) !important;
+      border-radius: 999px !important;
+    }
+
+
+    /* ========================================================
+       SETTINGS OVERLAY
+       ======================================================== */
+
+    #welivedit-settings-overlay {
+      position: absolute !important;
+      inset: 0 !important;
+
+      z-index: 2147483647 !important;
+
+      display: none !important;
+
+      align-items: center !important;
+      justify-content: center !important;
+
+      padding: 13px !important;
+      box-sizing: border-box !important;
+
+      background: rgba(15,25,19,.46) !important;
+
+      backdrop-filter: blur(1.5px) !important;
+      -webkit-backdrop-filter: blur(1.5px) !important;
+    }
+
+    #welivedit-settings-overlay.is-open {
+      display: flex !important;
+    }
+
+
+    #welivedit-settings-modal {
+      width: 100% !important;
+      max-height: calc(100% - 16px) !important;
+
+      display: flex !important;
+      flex-direction: column !important;
+
+      overflow: hidden !important;
+
+      background: #f8fbf9 !important;
+
+      border: 1px solid #b7cabd !important;
+      border-radius: 15px !important;
+
+      box-shadow:
+        0 18px 45px rgba(0,0,0,.30),
+        0 3px 12px rgba(0,0,0,.12) !important;
+    }
+
+
+    .welivedit-settings-header {
+      flex: 0 0 auto !important;
+
+      display: flex !important;
+      align-items: flex-start !important;
+      justify-content: space-between !important;
+
+      gap: 10px !important;
+
+      padding: 13px 14px 11px !important;
+
+      border-bottom: 1px solid #d6e1d9 !important;
+
+      background: #e6f1e9 !important;
+    }
+
+    .welivedit-settings-header h3 {
+      margin: 0 0 2px !important;
+      font-size: 16px !important;
+    }
+
+    .welivedit-settings-header small {
+      display: block !important;
+      color: #617069 !important;
+      font-size: 10px !important;
+      line-height: 1.3 !important;
+    }
+
+    #welivedit-settings-close {
+      border: 0 !important;
+      background: transparent !important;
+      color: #26333f !important;
+
+      font-size: 23px !important;
+      line-height: 1 !important;
+
+      width: 30px !important;
+      height: 30px !important;
+      padding: 0 !important;
+    }
+
+
+    #welivedit-settings-scroll {
+      flex: 1 1 auto !important;
+      min-height: 0 !important;
+
+      overflow-y: auto !important;
+
+      padding: 10px !important;
+    }
+
+
+    .welivedit-settings-section {
+      padding: 10px !important;
+      margin-bottom: 9px !important;
+
+      background: #fff !important;
+
+      border: 1px solid #d9e4dc !important;
+      border-radius: 10px !important;
+    }
+
+
+    .welivedit-settings-section-title {
+      margin-bottom: 7px !important;
+
+      color: #294335 !important;
+
+      font: 800 11px Arial,sans-serif !important;
+
+      text-transform: uppercase !important;
+      letter-spacing: .045em !important;
+    }
+
+
+    .welivedit-settings-explanation {
+      margin: 5px 0 8px !important;
+
+      color: #617069 !important;
+
+      font: 10px/1.4 Arial,sans-serif !important;
+    }
+
+
+    .welivedit-settings-link-button {
+      width: 100% !important;
+
+      padding: 8px 9px !important;
+
+      text-align: left !important;
+
+      background: #edf5ef !important;
+      color: #285d39 !important;
+
+      border: 1px solid #c9dccf !important;
+
+      font-size: 10px !important;
+    }
+
+
+    .welivedit-settings-placeholder-button {
+      width: 100% !important;
+
+      padding: 8px !important;
+
+      background: #eef1ef !important;
+      color: #89918c !important;
+
+      font-size: 10px !important;
+
+      cursor: default !important;
+    }
+
+
+    /* Existing controls inside settings */
+
+    #welivedit-settings-modal #welivedit-processing-controls {
+      margin: 0 !important;
+    }
+
+    #welivedit-settings-modal .welivedit-auth-box,
+    #welivedit-settings-modal .welivedit-account-box,
+    #welivedit-settings-modal .welivedit-auto-row {
+      margin: 6px 0 !important;
+    }
+
+
+    /* ========================================================
+       PAGE-LEVEL PRODUCT TOUR
+       ======================================================== */
+
+    #welivedit-tour-overlay {
+      position: fixed !important;
+      inset: 0 !important;
+
+      z-index: 2147483647 !important;
+
+      display: none !important;
+
+      pointer-events: auto !important;
+    }
+
+    #welivedit-tour-overlay.is-open {
+      display: block !important;
+    }
+
+    #welivedit-tour-spotlight {
+      position: fixed !important;
+
+      display: none;
+
+      z-index: 2147483647 !important;
+
+      border: 2px solid rgba(100, 174, 119, .95) !important;
+      border-radius: 11px !important;
+
+      box-shadow:
+        0 0 0 9999px rgba(10, 18, 13, .62),
+        0 0 0 5px rgba(100, 174, 119, .18) !important;
+
+      pointer-events: none !important;
+
+      transition:
+        left .18s ease,
+        top .18s ease,
+        width .18s ease,
+        height .18s ease !important;
+    }
+
+    #welivedit-tour-card {
+      position: fixed !important;
+
+      z-index: 2147483647 !important;
+
+      width: min(320px, calc(100vw - 28px)) !important;
+
+      box-sizing: border-box !important;
+
+      padding: 14px !important;
+
+      background: #fbfdfb !important;
+
+      border: 1px solid #b7cabd !important;
+      border-radius: 13px !important;
+
+      box-shadow:
+        0 18px 45px rgba(0,0,0,.34) !important;
+    }
+
+    .welivedit-tour-top {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+
+      margin-bottom: 7px !important;
+    }
+
+    #welivedit-tour-progress {
+      color: #718078 !important;
+      font: 700 10px Arial,sans-serif !important;
+    }
+
+    #welivedit-tour-close {
+      width: 27px !important;
+      height: 27px !important;
+
+      padding: 0 !important;
+
+      border: 0 !important;
+      background: transparent !important;
+
+      color: #26333f !important;
+
+      font-size: 22px !important;
+      line-height: 1 !important;
+    }
+
+    #welivedit-tour-title {
+      margin: 0 0 6px !important;
+
+      color: #24392c !important;
+      font-size: 15px !important;
+    }
+
+    #welivedit-tour-text {
+      margin: 0 0 13px !important;
+
+      color: #58665f !important;
+
+      font: 11px/1.45 Arial,sans-serif !important;
+    }
+
+    .welivedit-tour-actions {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+
+      gap: 8px !important;
+    }
+
+    .welivedit-tour-nav {
+      display: flex !important;
+      gap: 6px !important;
+    }
+
+    .welivedit-tour-actions button {
+      padding: 7px 10px !important;
+      font-size: 10px !important;
+    }
+
+    .welivedit-tour-secondary {
+      background: #e7eee9 !important;
+      color: #405049 !important;
+    }
+
+
+
+    /* Product-tour polish */
+
+    #welivedit-tour-card {
+      width: 300px !important;
+      padding: 16px !important;
+
+      background:
+        linear-gradient(
+          180deg,
+          #ffffff 0%,
+          #f8fbf9 100%
+        ) !important;
+
+      border: 1px solid #c7dbcd !important;
+      border-radius: 16px !important;
+
+      box-shadow:
+        0 22px 60px rgba(0,0,0,.30),
+        0 4px 14px rgba(0,0,0,.12) !important;
+    }
+
+    #welivedit-tour-progress {
+      display: inline-flex !important;
+      align-items: center !important;
+
+      min-height: 22px !important;
+
+      padding: 0 8px !important;
+
+      border-radius: 999px !important;
+
+      background: #e8f3eb !important;
+      color: #367148 !important;
+
+      font-size: 10px !important;
+      font-weight: 800 !important;
+    }
+
+    #welivedit-tour-title {
+      margin: 10px 0 7px !important;
+
+      color: #1e3426 !important;
+
+      font-size: 16px !important;
+      font-weight: 800 !important;
+      line-height: 1.2 !important;
+    }
+
+    #welivedit-tour-text {
+      margin-bottom: 17px !important;
+
+      color: #59665e !important;
+
+      font-size: 11px !important;
+      line-height: 1.5 !important;
+    }
+
+    #welivedit-tour-next {
+      min-width: 68px !important;
+
+      background: #438951 !important;
+      color: white !important;
+
+      border-radius: 8px !important;
+    }
+
+    #welivedit-tour-back,
+    #welivedit-tour-skip {
+      background: transparent !important;
+      color: #526158 !important;
+    }
+
+    #welivedit-tour-skip {
+      padding-left: 0 !important;
+    }
+
+    #welivedit-tour-spotlight {
+      border: 2px solid rgba(90,170,111,.95) !important;
+
+      box-shadow:
+        0 0 0 9999px rgba(8,14,10,.68),
+        0 0 0 5px rgba(90,170,111,.16),
+        0 5px 20px rgba(0,0,0,.18) !important;
+    }
+
+
+
+    /* Personal word rules */
+
+    #welivedit-blocked-words-overlay {
+      position: absolute !important;
+      inset: 0 !important;
+
+      z-index: 2147483647 !important;
+
+      display: none !important;
+      align-items: center !important;
+      justify-content: center !important;
+
+      padding: 13px !important;
+
+      box-sizing: border-box !important;
+
+      background: rgba(15,25,19,.48) !important;
+
+      backdrop-filter: blur(1.5px) !important;
+      -webkit-backdrop-filter: blur(1.5px) !important;
+    }
+
+    #welivedit-blocked-words-overlay.is-open {
+      display: flex !important;
+    }
+
+    #welivedit-blocked-words-modal {
+      width: 100% !important;
+      max-height: calc(100% - 18px) !important;
+
+      display: flex !important;
+      flex-direction: column !important;
+
+      overflow: hidden !important;
+
+      background: #f8fbf9 !important;
+
+      border: 1px solid #b7cabd !important;
+      border-radius: 15px !important;
+
+      box-shadow:
+        0 18px 45px rgba(0,0,0,.30) !important;
+    }
+
+    .welivedit-blocked-words-body {
+      overflow-y: auto !important;
+      padding: 12px !important;
+    }
+
+    #welivedit-blocked-words-form {
+      display: grid !important;
+      grid-template-columns: 1fr auto !important;
+
+      gap: 7px !important;
+
+      margin: 9px 0 12px !important;
+    }
+
+    #welivedit-blocked-words-input {
+      width: 100% !important;
+
+      border: 1px solid #cbd9cf !important;
+      background: #fff !important;
+      color: #243129 !important;
+      caret-color: #243129 !important;
+
+      padding: 8px 9px !important;
+
+      border-radius: 8px !important;
+
+      font-size: 11px !important;
+    }
+
+    #welivedit-blocked-words-input::placeholder {
+      color: #7b877f !important;
+      opacity: 1 !important;
+    }
+
+    #welivedit-blocked-words-list {
+      display: flex !important;
+      flex-direction: column !important;
+
+      gap: 6px !important;
+    }
+
+    .welivedit-blocked-word-row {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+
+      gap: 8px !important;
+
+      padding: 7px 8px !important;
+
+      background: #edf5ef !important;
+
+      border: 1px solid #cfdfd3 !important;
+      border-radius: 8px !important;
+
+      color: #294936 !important;
+
+      font-size: 11px !important;
+    }
+
+    .welivedit-blocked-word-row span {
+      overflow-wrap: anywhere !important;
+    }
+
+    .welivedit-blocked-word-row button {
+      flex: 0 0 auto !important;
+
+      width: 25px !important;
+      height: 25px !important;
+
+      padding: 0 !important;
+
+      border-radius: 50% !important;
+
+      background: transparent !important;
+      color: #65756b !important;
+
+      font-size: 17px !important;
+    }
+
+    .welivedit-blocked-words-note {
+      margin-top: 12px !important;
+
+      padding-top: 9px !important;
+
+      border-top: 1px solid #dce6df !important;
+
+      color: #728078 !important;
+
+      font: 9px/1.4 Arial,sans-serif !important;
+    }
+
+
+
+    /* ========================================================
+       REPLY CLASSIFICATION TONES
+       ======================================================== */
+
+    .welivedit-card {
+      border: 1px solid rgba(60,75,65,.13) !important;
+      transition:
+        border-color .15s ease,
+        box-shadow .15s ease !important;
+    }
+
+    .welivedit-card.is-safe {
+      border-color: rgba(74,145,92,.30) !important;
+      box-shadow:
+        inset 3px 0 0 rgba(74,145,92,.35) !important;
+    }
+
+    .welivedit-card.is-harmful {
+      border-color: rgba(184,82,82,.30) !important;
+      box-shadow:
+        inset 3px 0 0 rgba(184,82,82,.42) !important;
+    }
+
+    .welivedit-card.is-user-rule {
+      border-color: rgba(183,137,58,.34) !important;
+      box-shadow:
+        inset 3px 0 0 rgba(183,137,58,.44) !important;
+    }
+
+    .welivedit-card.is-error {
+      border-color: rgba(150,90,90,.28) !important;
+    }
+
+    .welivedit-card.is-pending {
+      border-color: rgba(95,110,101,.18) !important;
+    }
+
+    .welivedit-card-reason {
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 3px !important;
+
+      padding: 8px 9px !important;
+      margin: 5px 0 !important;
+
+      border-radius: 8px !important;
+
+      font-size: 10px !important;
+      line-height: 1.35 !important;
+    }
+
+    .welivedit-card-reason strong {
+      font-size: 10px !important;
+      font-weight: 700 !important;
+    }
+
+    .welivedit-card-reason span {
+      opacity: .72 !important;
+      font-size: 9px !important;
+    }
+
+    .welivedit-card-reason.is-harmful {
+      background: rgba(184,82,82,.07) !important;
+      color: #694040 !important;
+    }
+
+    .welivedit-card-reason.is-user-rule {
+      background: rgba(183,137,58,.08) !important;
+      color: #665126 !important;
+    }
+
+
+  `;
+
+  document.head.appendChild(style);
+}
+
+function ensureBlockedWordsModal() {
+  const panel = document.getElementById("welivedit-panel");
+  if (!panel) return null;
+
+  let overlay =
+    document.getElementById("welivedit-blocked-words-overlay");
+
+  if (overlay) return overlay;
+
+  overlay = document.createElement("div");
+  overlay.id = "welivedit-blocked-words-overlay";
+  overlay.setAttribute("aria-hidden", "true");
+
+  overlay.innerHTML = `
+    <div
+      id="welivedit-blocked-words-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="welivedit-blocked-words-title"
+    >
+      <div class="welivedit-settings-header">
+        <div>
+          <h3 id="welivedit-blocked-words-title">
+            Always hide words or phrases
+          </h3>
+
+          <small>
+            These rules stay on this device and work independently
+            from the classifier.
+          </small>
+        </div>
+
+        <button
+          id="welivedit-blocked-words-close"
+          type="button"
+          aria-label="Close"
+        >×</button>
+      </div>
+
+      <div class="welivedit-blocked-words-body">
+
+        <p class="welivedit-settings-explanation">
+          If a reply contains any item below, WeLivedIt will hide it
+          even if the model considers the reply safe.
+        </p>
+
+        <form id="welivedit-blocked-words-form">
+          <input
+            id="welivedit-blocked-words-input"
+            type="text"
+            maxlength="160"
+            placeholder="Word or phrase"
+            autocomplete="off"
+          />
+
+          <button type="submit">
+            Add
+          </button>
+        </form>
+
+        <div id="welivedit-blocked-words-list"></div>
+
+        <div
+          id="welivedit-blocked-words-empty"
+          class="welivedit-settings-explanation"
+        >
+          You have no personal word rules yet.
+        </div>
+
+        <div class="welivedit-blocked-words-note">
+          Matching ignores capitalization.
+          Phrases are matched as written inside the reply.
+        </div>
+
+      </div>
+    </div>
+  `;
+
+  panel.appendChild(overlay);
+
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) {
+      closeBlockedWordsModal();
+    }
+  });
+
+  document
+    .getElementById("welivedit-blocked-words-close")
+    ?.addEventListener("click", closeBlockedWordsModal);
+
+  document
+    .getElementById("welivedit-blocked-words-form")
+    ?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const input =
+        document.getElementById("welivedit-blocked-words-input");
+
+      const value = String(input?.value || "").trim();
+
+      if (!value) return;
+
+      const normalized = normalizeProtectionText(value);
+
+      const exists = state.blockedWords.some(
+        (entry) =>
+          normalizeProtectionText(entry) === normalized
+      );
+
+      if (!exists) {
+        state.blockedWords.push(value);
+
+        await storageSet({
+          [STORAGE_KEYS.blockedWords]: state.blockedWords
+        });
+      }
+
+      if (input) input.value = "";
+
+      renderBlockedWordsList();
+      reapplyBlockedWordRules();
+    });
+
+  renderBlockedWordsList();
+
+  return overlay;
+}
+
+
+function renderBlockedWordsList() {
+  const list =
+    document.getElementById("welivedit-blocked-words-list");
+
+  const empty =
+    document.getElementById("welivedit-blocked-words-empty");
+
+  if (!list || !empty) return;
+
+  list.innerHTML = "";
+
+  empty.style.display =
+    state.blockedWords.length ? "none" : "block";
+
+  state.blockedWords.forEach((word, index) => {
+    const row = document.createElement("div");
+    row.className = "welivedit-blocked-word-row";
+
+    const label = document.createElement("span");
+    label.textContent = word;
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.setAttribute(
+      "aria-label",
+      `Remove ${word}`
+    );
+
+    remove.addEventListener("click", async () => {
+      state.blockedWords.splice(index, 1);
+
+      await storageSet({
+        [STORAGE_KEYS.blockedWords]: state.blockedWords
+      });
+
+      renderBlockedWordsList();
+      reapplyBlockedWordRules();
+    });
+
+    row.appendChild(label);
+    row.appendChild(remove);
+
+    list.appendChild(row);
+  });
+}
+
+
+function openBlockedWordsModal() {
+  closeSettingsModal();
+
+  const overlay = ensureBlockedWordsModal();
+  if (!overlay) return;
+
+  renderBlockedWordsList();
+
+  overlay.classList.add("is-open");
+  overlay.setAttribute("aria-hidden", "false");
+
+  document
+    .getElementById("welivedit-blocked-words-input")
+    ?.focus();
+}
+
+
+function closeBlockedWordsModal() {
+  const overlay =
+    document.getElementById("welivedit-blocked-words-overlay");
+
+  if (!overlay) return;
+
+  overlay.classList.remove("is-open");
+  overlay.setAttribute("aria-hidden", "true");
+}
+
+
+function ensureSettingsModal() {
+  const panel = document.getElementById("welivedit-panel");
+  if (!panel) return null;
+
+  let overlay = document.getElementById("welivedit-settings-overlay");
+
+  if (overlay) return overlay;
+
+  overlay = document.createElement("div");
+  overlay.id = "welivedit-settings-overlay";
+  overlay.setAttribute("aria-hidden", "true");
+
+  overlay.innerHTML = `
+    <div
+      id="welivedit-settings-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="welivedit-settings-title"
+    >
+      <div class="welivedit-settings-header">
+        <div>
+          <h3 id="welivedit-settings-title">Settings</h3>
+          <small>Choose how WeLivedIt protects you and handles your data.</small>
+        </div>
+
+        <button
+          id="welivedit-settings-close"
+          type="button"
+          aria-label="Close settings"
+        >×</button>
+      </div>
+
+      <div id="welivedit-settings-scroll">
+
+        <section class="welivedit-settings-section">
+          <div class="welivedit-settings-section-title">
+            Processing
+          </div>
+
+          <div id="welivedit-settings-processing-slot"></div>
+        </section>
+
+
+        <section class="welivedit-settings-section">
+          <div class="welivedit-settings-section-title">
+            Account
+          </div>
+
+          <p class="welivedit-settings-explanation">
+            An account is optional for local protection.
+            Sign in for feedback and saved online features.
+          </p>
+
+          <div id="welivedit-settings-auth-slot"></div>
+          <div id="welivedit-settings-account-slot"></div>
+        </section>
+
+
+        <section class="welivedit-settings-section">
+          <div class="welivedit-settings-section-title">
+            Protection
+          </div>
+
+          <div id="welivedit-settings-auto-slot"></div>
+        </section>
+
+
+        <section class="welivedit-settings-section">
+          <div class="welivedit-settings-section-title">
+            Your words
+          </div>
+
+          <p class="welivedit-settings-explanation">
+            Define words or phrases that should always be hidden,
+            regardless of what the model predicts.
+          </p>
+
+          <button
+            id="welivedit-settings-blocked-words"
+            type="button"
+            class="welivedit-settings-link-button"
+          >
+            🛡 Always hidden words and phrases
+          </button>
+        </section>
+
+
+        <section
+          id="welivedit-settings-privacy"
+          class="welivedit-settings-section"
+        >
+          <div class="welivedit-settings-section-title">
+            How we use your data
+          </div>
+
+          <p class="welivedit-settings-explanation">
+            You choose where processing happens and whether you sign in.
+            On-device protection can run without an account.
+            Local processing does not send replies to WeLivedIt for
+            classification.
+          </p>
+
+          <p class="welivedit-settings-explanation">
+            Features such as online processing, saved account features,
+            or sending feedback may communicate with WeLivedIt servers.
+          </p>
+
+          <button
+            type="button"
+            class="welivedit-settings-placeholder-button"
+            disabled
+          >
+            Learn more · Coming soon
+          </button>
+        </section>
+
+
+        <section class="welivedit-settings-section">
+          <div class="welivedit-settings-section-title">
+            Help
+          </div>
+
+          <button
+            id="welivedit-take-tour"
+            type="button"
+            class="welivedit-settings-link-button"
+          >
+            👋 Take the tour
+          </button>
+        </section>
+
+      </div>
+    </div>
+  `;
+
+  panel.appendChild(overlay);
+
+  document
+    .getElementById("welivedit-settings-close")
+    ?.addEventListener("click", closeSettingsModal);
+
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) {
+      closeSettingsModal();
+    }
+  });
+
+  document
+    .getElementById("welivedit-settings-blocked-words")
+    ?.addEventListener(
+      "click",
+      openBlockedWordsModal
+    );
+
+  document
+    .getElementById("welivedit-take-tour")
+    ?.addEventListener("click", openWeliveditTour);
+
+  // ----------------------------------------------------------
+  // Move EXISTING controls. Their event listeners remain intact.
+  // ----------------------------------------------------------
+
+  const processing =
+    document.getElementById("welivedit-processing-controls");
+
+  const auth =
+    panel.querySelector(".welivedit-auth-box");
+
+  const account =
+    document.getElementById("welivedit-thread-account");
+
+  const auto =
+    panel.querySelector(".welivedit-auto-row");
+
+  if (processing) {
+    document
+      .getElementById("welivedit-settings-processing-slot")
+      ?.appendChild(processing);
+  }
+
+  if (auth) {
+    document
+      .getElementById("welivedit-settings-auth-slot")
+      ?.appendChild(auth);
+  }
+
+  if (account) {
+    document
+      .getElementById("welivedit-settings-account-slot")
+      ?.appendChild(account);
+  }
+
+  if (auto) {
+    document
+      .getElementById("welivedit-settings-auto-slot")
+      ?.appendChild(auto);
+  }
+
+  return overlay;
+}
+
+
+function openSettingsModal() {
+  const overlay =
+    ensureSettingsModal() ||
+    document.getElementById("welivedit-settings-overlay");
+
+  if (!overlay) return;
+
+  overlay.classList.add("is-open");
+  overlay.setAttribute("aria-hidden", "false");
+
+  document
+    .getElementById("welivedit-settings-close")
+    ?.focus();
+}
+
+
+function closeSettingsModal() {
+  const overlay =
+    document.getElementById("welivedit-settings-overlay");
+
+  if (!overlay) return;
+
+  overlay.classList.remove("is-open");
+  overlay.setAttribute("aria-hidden", "true");
+
+  document
+    .getElementById("welivedit-settings-button")
+    ?.focus();
+}
+
+
+
+const WELIVEDIT_TOUR_STEPS = [
+  {
+    target: "#welivedit-settings-button",
+    view: "main",
+    title: "Make WeLivedIt yours",
+    text:
+      "Settings is where you choose how protection works, whether processing stays on your device, and which optional features you want to use.",
+  },
+
+  {
+    target: "#welivedit-processing-controls",
+    view: "settings",
+    title: "Choose where processing happens",
+    text:
+      "On this device keeps reply classification local. Online processing uses WeLivedIt servers. Local protection does not require an account.",
+  },
+
+  {
+    target: "#welivedit-settings-auth-slot",
+    view: "settings",
+    title: "An account is optional",
+    text:
+      "You can use local protection without signing in. An account is used for optional features such as feedback and saved online features.",
+  },
+
+  {
+    target: "#welivedit-settings-auto-slot",
+    view: "settings",
+    title: "Automatic protection",
+    text:
+      "Auto-check can analyze new replies as they appear, so protection does not depend on manually pressing Analyze each time.",
+  },
+
+  {
+    target: "#welivedit-settings-privacy",
+    view: "settings",
+    title: "You control your data",
+    text:
+      "WeLivedIt separates processing, sign-in, and data handling. The Learn more page will later document the architecture and data flows in detail.",
+  },
+
+  {
+    target: "#welivedit-climate",
+    view: "main",
+    title: "See the conversation climate",
+    text:
+      "Comment climate summarizes the checked conversation and shows how much harmful content is currently being kept out of view.",
+  },
+
+  {
+    target: ".welivedit-card",
+    view: "main",
+    title: "Stay in control of every reply",
+    text:
+      "Each checked reply appears here. Show or Hide changes visibility, while Focus takes you to its position on X without needing to reveal harmful content.",
+  },
+
+  {
+    target: "#welivedit-blocked-words-shortcut",
+    view: "main",
+    title: "Add your own protection rules",
+    text:
+      "You will also be able to define words or phrases that should always be hidden, regardless of what the model predicts.",
+  },
+];
+
+let weliveditTourIndex = 0;
+
+
+function ensureWeliveditTour() {
+  const panel = document.getElementById("welivedit-panel");
+  if (!panel) return null;
+
+  let overlay = document.getElementById("welivedit-tour-overlay");
+  if (overlay) return overlay;
+
+  overlay = document.createElement("div");
+  overlay.id = "welivedit-tour-overlay";
+  overlay.setAttribute("aria-hidden", "true");
+
+  overlay.innerHTML = `
+    <div id="welivedit-tour-spotlight"></div>
+
+    <div
+      id="welivedit-tour-card"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="welivedit-tour-title"
+    >
+      <div class="welivedit-tour-top">
+        <span id="welivedit-tour-progress"></span>
+
+        <button
+          id="welivedit-tour-close"
+          type="button"
+          aria-label="Close tour"
+        >×</button>
+      </div>
+
+      <h3 id="welivedit-tour-title"></h3>
+      <p id="welivedit-tour-text"></p>
+
+      <div class="welivedit-tour-actions">
+        <button
+          id="welivedit-tour-skip"
+          type="button"
+          class="welivedit-tour-secondary"
+        >
+          Skip tour
+        </button>
+
+        <div class="welivedit-tour-nav">
+          <button
+            id="welivedit-tour-back"
+            type="button"
+            class="welivedit-tour-secondary"
+          >
+            Back
+          </button>
+
+          <button
+            id="welivedit-tour-next"
+            type="button"
+          >
+            Next
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  const close = (event) => {
+    event?.preventDefault();
+    event?.stopPropagation();
+    closeWeliveditTour();
+  };
+
+  document
+    .getElementById("welivedit-tour-close")
+    ?.addEventListener("click", close);
+
+  document
+    .getElementById("welivedit-tour-skip")
+    ?.addEventListener("click", close);
+
+  document
+    .getElementById("welivedit-tour-back")
+    ?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (weliveditTourIndex > 0) {
+        weliveditTourIndex -= 1;
+        renderWeliveditTour();
+      }
+    });
+
+  document
+    .getElementById("welivedit-tour-next")
+    ?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (weliveditTourIndex >= WELIVEDIT_TOUR_STEPS.length - 1) {
+        closeWeliveditTour();
+        return;
+      }
+
+      weliveditTourIndex += 1;
+      renderWeliveditTour();
+    });
+
+  return overlay;
+}
+
+
+function positionWeliveditTour() {
+  const card =
+    document.getElementById("welivedit-tour-card");
+
+  const spotlight =
+    document.getElementById("welivedit-tour-spotlight");
+
+  const step =
+    WELIVEDIT_TOUR_STEPS[weliveditTourIndex];
+
+  if (!card || !spotlight || !step) return;
+
+  const target =
+    document.querySelector(step.target);
+
+  if (!target) {
+    spotlight.style.display = "none";
+
+    card.style.left = "50%";
+    card.style.top = "50%";
+    card.style.right = "auto";
+    card.style.bottom = "auto";
+    card.style.transform = "translate(-50%, -50%)";
+
+    return;
+  }
+
+  target.scrollIntoView({
+    behavior: "smooth",
+    block: "center",
+  });
+
+  window.setTimeout(() => {
+    const rect = target.getBoundingClientRect();
+
+    const padding = 6;
+
+    const left = Math.max(4, rect.left - padding);
+    const top = Math.max(4, rect.top - padding);
+    const width = rect.width + padding * 2;
+    const height = rect.height + padding * 2;
+
+    spotlight.style.display = "block";
+    spotlight.style.left = `${left}px`;
+    spotlight.style.top = `${top}px`;
+    spotlight.style.width = `${width}px`;
+    spotlight.style.height = `${height}px`;
+
+    card.style.transform = "none";
+    card.style.right = "auto";
+    card.style.bottom = "auto";
+
+    const sidebar =
+      document.getElementById("welivedit-panel");
+
+    const sidebarRect =
+      sidebar?.getBoundingClientRect();
+
+    const cardWidth = 320;
+    const gap = 14;
+
+    // If target is inside the WeLivedIt sidebar,
+    // put the explanation immediately to its LEFT, over X.
+    if (
+      sidebar &&
+      sidebar.contains(target) &&
+      sidebarRect
+    ) {
+      const preferredLeft =
+        sidebarRect.left - cardWidth - gap;
+
+      card.style.left =
+        `${Math.max(12, preferredLeft)}px`;
+
+      const preferredTop =
+        Math.min(
+          window.innerHeight - 210,
+          Math.max(12, rect.top)
+        );
+
+      card.style.top =
+        `${preferredTop}px`;
+
+      return;
+    }
+
+    // Target is on X.
+    // Put the card on whichever side has more room.
+    const roomRight =
+      window.innerWidth - rect.right;
+
+    const roomLeft =
+      rect.left;
+
+    if (roomRight >= cardWidth + gap) {
+      card.style.left =
+        `${rect.right + gap}px`;
+
+      card.style.top =
+        `${Math.max(12, Math.min(rect.top, window.innerHeight - 210))}px`;
+
+      return;
+    }
+
+    if (roomLeft >= cardWidth + gap) {
+      card.style.left =
+        `${rect.left - cardWidth - gap}px`;
+
+      card.style.top =
+        `${Math.max(12, Math.min(rect.top, window.innerHeight - 210))}px`;
+
+      return;
+    }
+
+    // Fallback: bottom-centre.
+    card.style.left = "50%";
+    card.style.top = "auto";
+    card.style.bottom = "18px";
+    card.style.transform = "translateX(-50%)";
+  }, 250);
+}
+function renderWeliveditTour() {
+  const step = WELIVEDIT_TOUR_STEPS[weliveditTourIndex];
+  if (!step) return;
+
+  // The tour demonstrates the real UI instead of only describing it.
+  if (step.view === "settings") {
+    const settingsOverlay = ensureSettingsModal();
+
+    if (settingsOverlay) {
+      settingsOverlay.classList.add("is-open");
+      settingsOverlay.setAttribute("aria-hidden", "false");
+    }
+  } else {
+    const settingsOverlay =
+      document.getElementById("welivedit-settings-overlay");
+
+    if (settingsOverlay) {
+      settingsOverlay.classList.remove("is-open");
+      settingsOverlay.setAttribute("aria-hidden", "true");
+    }
+  }
+
+  const progress =
+    document.getElementById("welivedit-tour-progress");
+
+  const title =
+    document.getElementById("welivedit-tour-title");
+
+  const text =
+    document.getElementById("welivedit-tour-text");
+
+  const back =
+    document.getElementById("welivedit-tour-back");
+
+  const next =
+    document.getElementById("welivedit-tour-next");
+
+  if (progress) {
+    progress.textContent =
+      `${weliveditTourIndex + 1} / ${WELIVEDIT_TOUR_STEPS.length}`;
+  }
+
+  if (title) title.textContent = step.title;
+  if (text) text.textContent = step.text;
+
+  if (back) {
+    back.style.visibility =
+      weliveditTourIndex === 0 ? "hidden" : "visible";
+  }
+
+  if (next) {
+    next.textContent =
+      weliveditTourIndex === WELIVEDIT_TOUR_STEPS.length - 1
+        ? "Finish"
+        : "Next";
+  }
+
+  positionWeliveditTour();
+}
+
+
+
+function maybeOpenFirstRunTour() {
+  if (state.onboardingComplete) return;
+
+  // Give X and the extension UI a moment to settle before spotlighting it.
+  window.setTimeout(() => {
+    if (state.onboardingComplete) return;
+
+    const panel =
+      document.getElementById("welivedit-panel");
+
+    if (!panel) return;
+
+    panel.classList.add("open");
+
+    openWeliveditTour();
+  }, 900);
+}
+
+
+function markWeliveditOnboardingComplete() {
+  if (state.onboardingComplete) return;
+
+  state.onboardingComplete = true;
+
+  storageSet({
+    [STORAGE_KEYS.onboardingComplete]: true
+  }).catch((error) => {
+    console.warn(
+      "[WeLivedIt] could not persist onboarding state",
+      error
+    );
+  });
+}
+
+
+function openWeliveditTour() {
+  closeSettingsModal();
+
+  const overlay = ensureWeliveditTour();
+  if (!overlay) return;
+
+  weliveditTourIndex = 0;
+
+  overlay.classList.add("is-open");
+  overlay.setAttribute("aria-hidden", "false");
+
+  renderWeliveditTour();
+}
+
+
+function closeWeliveditTour() {
+  markWeliveditOnboardingComplete();
+
+  const overlay =
+    document.getElementById("welivedit-tour-overlay");
+
+  const spotlight =
+    document.getElementById("welivedit-tour-spotlight");
+
+  if (spotlight) {
+    spotlight.style.display = "none";
+  }
+
+  if (!overlay) return;
+
+  overlay.classList.remove("is-open");
+  overlay.setAttribute("aria-hidden", "true");
+  overlay.style.display = "none";
+
+  // Remove the inline display on the next opening.
+  window.setTimeout(() => {
+    overlay.style.removeProperty("display");
+  }, 0);
+}
+
+
+function refreshWeliveditTourPosition() {
+  const overlay =
+    document.getElementById("welivedit-tour-overlay");
+
+  if (!overlay?.classList.contains("is-open")) return;
+
+  positionWeliveditTour();
+}
+
+window.addEventListener(
+  "resize",
+  refreshWeliveditTourPosition
+);
+
 
 function runtimeMessage(message) {
   return new Promise((resolve) => {
@@ -441,7 +2508,7 @@ function updateAuthUi() {
     if (formEl) formEl.style.display = "none";
     if (signedEl) signedEl.style.display = "block";
   } else {
-    authEl.textContent = "Sign in to send replies.";
+    authEl.textContent = "Optional account — sign in for feedback and saved features.";
     authEl.className = "welivedit-auth-current warn";
     if (formEl) formEl.style.display = "grid";
     if (signedEl) {
@@ -495,13 +2562,9 @@ async function logoutFromPanel() {
 }
 
 async function ensureAuthIfNeeded() {
-  if (!state.authEnabled) return true;
-  if (state.authStatus.authenticated) return true;
-  await refreshAuthStatus(false);
-  if (state.authStatus.authenticated) return true;
-  setStatus("Please sign in once before analyzing replies.");
-  document.getElementById("welivedit-panel")?.classList.add("open");
-  return false;
+  // Screening is available without an account.
+  // Authentication is only required for account/persistence/feedback features.
+  return true;
 }
 
 function normalizeAccountId(value) {
@@ -538,9 +2601,6 @@ function viewerLinkedAccountForOriginalPost() {
 }
 
 function getThreadAnalysisPermission() {
-  if (!state.authStatus.authenticated) {
-    return { allowed: false, canPromptLogin: true, reason: "Sign in to analyze replies." };
-  }
   if (!state.communityId) {
     return { allowed: false, reason: "No community is selected." };
   }
@@ -596,10 +2656,10 @@ function updateSendPermissionsUi() {
   const storage = getThreadStoragePermission();
 
   if (sendButton) {
-    if (!state.authStatus.authenticated) {
+    if (state.authEnabled && !state.authStatus.authenticated) {
       sendButton.disabled = false;
-      sendButton.textContent = "Sign in to analyze replies";
-      sendButton.title = "Sign in first; analysis is available on any post.";
+      sendButton.textContent = "Analyze replies";
+      sendButton.title = "Analysis is available without an account.";
     } else if (!analysis.allowed) {
       sendButton.disabled = true;
       sendButton.textContent = "Open a post to analyze";
@@ -883,6 +2943,7 @@ function scanVisibleReplies({ render = true, hide = true } = {}) {
         classified: false,
         classification: null,
         hidden: true,
+        manualHidden: false,
         resolveDone: false,
         analyzeAttempted: false,
       });
@@ -896,15 +2957,30 @@ function scanVisibleReplies({ render = true, hide = true } = {}) {
       current.author_name = reply.author_name;
     }
     const currentItem = state.items.get(reply.client_key);
+
+    if (currentItem?.classified) {
+      ensureFeedbackControls(currentItem);
+    }
     currentItem.dom_order = domOrder;
     hydrateItemFromSeen(currentItem);
     updateArticleMark(currentItem);
-    if (hide && !currentItem.manualRevealed) {
-      if (currentItem.classified) {
-        const keepHidden = isHarmful(currentItem.classification);
-        applyHidden(currentItem.client_key, keepHidden, keepHidden ? "Message hidden. It may need care." : "");
-      } else {
-        applyHidden(currentItem.client_key, true, coverLabelForItem(currentItem));
+    if (hide) {
+      if (currentItem.manualHidden) {
+        applyHidden(
+          currentItem.client_key,
+          true,
+          currentItem.classified && isHarmful(currentItem.classification)
+            ? "Message hidden. It may need care."
+            : "Message hidden.",
+          { force: true }
+        );
+      } else if (!currentItem.manualRevealed) {
+        if (currentItem.classified) {
+          const keepHidden = isHarmful(currentItem.classification);
+          applyHidden(currentItem.client_key, keepHidden, keepHidden ? "Message hidden. It may need care." : "");
+        } else {
+          applyHidden(currentItem.client_key, true, coverLabelForItem(currentItem));
+        }
       }
     }
   }
@@ -1027,6 +3103,10 @@ function applyThreadAccountResponse(response, fallbackOriginal = null) {
 }
 
 function scheduleThreadAccountRefresh(originalOverride = null, { force = false } = {}) {
+  // Local processing must not send thread/account data automatically.
+  if (state.processingMode === "local") {
+    return;
+  }
   const original = originalOverride || state.originalPost;
   if (!isOriginalForCurrentThread(original) || !original?.author_username) {
     // Do not erase a valid pinned owner merely because X virtualized the
@@ -1046,6 +3126,11 @@ function scheduleThreadAccountRefresh(originalOverride = null, { force = false }
 }
 
 async function refreshThreadAccount(originalOverride = null, { force = false } = {}) {
+  // Local processing must not resolve accounts automatically.
+  if (state.processingMode === "local") {
+    return;
+  }
+
   const original = originalOverride || state.originalPost;
   const payload = accountRequestPayload(original);
   if (!payload) return null;
@@ -1238,7 +3323,12 @@ const MAX_SEEN_RECORDS = 2000;
 
 function itemSeenKey(item) {
   const id = String(item?.comment_id || item?.x_id || item?.client_key || "").replace(/^x:/, "");
-  return `${SEEN_CACHE_NAMESPACE}|${state.classifierCacheKey || state.apiBaseUrl}|${state.communityId}|${state.model}|x|${id}`;
+  const classifierKey =
+    state.processingMode === "local"
+      ? "local_hatebert_q8_0.51"
+      : (state.classifierCacheKey || state.apiBaseUrl);
+
+  return `${SEEN_CACHE_NAMESPACE}|${classifierKey}|${state.communityId}|${state.model}|x|${id}`;
 }
 
 function minimalClassification(classification) {
@@ -1263,6 +3353,10 @@ function hydrateItemFromSeen(item) {
   item.resolveDone = Boolean(record.resolve_done);
   item.analyzeAttempted = Boolean(record.analyze_attempted);
   item.autoBlocked = Boolean(record.blocked);
+  if (typeof record.manual_hidden === "boolean") {
+    item.manualHidden = record.manual_hidden;
+    if (item.manualHidden) item.manualRevealed = false;
+  }
   item.status = record.status || item.status;
   item.classification_id = record.classification_id || item.classification_id;
   if (record.classification) {
@@ -1295,6 +3389,7 @@ function rememberItem(item, patch = {}) {
     status: item.status,
     resolve_done: Boolean(item.resolveDone),
     analyze_attempted: Boolean(item.analyzeAttempted),
+    manual_hidden: Boolean(item.manualHidden),
     classification_id: item.classification_id || item.classification?.classification_id || previous.classification_id || null,
     classification: item.classified ? minimalClassification(item.classification) : (previous.classification || null),
     updated_at: Date.now(),
@@ -1361,7 +3456,16 @@ function applyServerItemToItem(item, serverItem, { render = true } = {}) {
   if (current && current !== item) Object.assign(current, item);
   const visibleItem = current || item;
   if (state.items.has(visibleItem.client_key)) {
-    if (visibleItem.classified) {
+    if (visibleItem.manualHidden) {
+      applyHidden(
+        visibleItem.client_key,
+        true,
+        visibleItem.classified && isHarmful(visibleItem.classification)
+          ? "Message hidden. It may need care."
+          : "Message hidden.",
+        { force: true }
+      );
+    } else if (visibleItem.classified) {
       const keepHidden = isHarmful(visibleItem.classification);
       if (!visibleItem.manualRevealed) applyHidden(visibleItem.client_key, keepHidden, keepHidden ? "Message hidden. It may need care." : "");
     } else if (!visibleItem.manualRevealed) {
@@ -1411,6 +3515,37 @@ function chunkItems(items, size) {
 }
 
 async function resolveItemsInBatches(items) {
+  // Local classifier mode never uses server-side resolve/cache lookup.
+  if (state.processingMode === "local") {
+    const pending = items.filter(
+      (item) => item && !item.classified && !state.inFlight.has(item.client_key)
+    );
+
+    for (const item of pending) {
+      item.resolveDone = true;
+      item.status = "queued_analyze";
+      item.lastError = null;
+      updateArticleMark(item);
+
+      if (!item.manualRevealed) {
+        applyHidden(
+          item.client_key,
+          true,
+          "Message hidden until it is checked."
+        );
+      }
+    }
+
+    renderPanel();
+
+    return {
+      attempted: 0,
+      classified: 0,
+      failed: false,
+      skippedForAnalysisOnly: true,
+    };
+  }
+
   const pending = items.filter((item) => item && !item.classified && !item.resolveDone && !state.inFlight.has(item.client_key));
   if (!pending.length) return { attempted: 0, classified: 0, failed: false, skippedForAnalysisOnly: false };
 
@@ -1490,75 +3625,223 @@ async function resolveItemsInBatches(items) {
 
 async function processSingleItem(item, { manual = false } = {}) {
   if (!item) return;
+
   const key = item.client_key;
   state.inFlight.add(key);
   item.autoBlocked = false;
+
   try {
     hydrateItemFromSeen(item);
+
     if (item.classified) {
       updateArticleMark(item);
       return;
     }
+
     if (item.autoBlocked && !manual) return;
 
+    // ============================================================
+    // LOCAL HATEBERT MODE
+    // No resolve endpoint and no analyze endpoint.
+    // Login is independent from where inference runs.
+    // ============================================================
+    if (state.processingMode === "local") {
+      if (!globalThis.WELIVEDIT_HATEBERT?.classify) {
+        throw new Error("Local HateBERT classifier is not available.");
+      }
+
+      item.resolveDone = true;
+      item.status = "analyzing";
+      item.analyzeAttempted = true;
+      item.lastError = null;
+
+      updateArticleMark(item);
+
+      if (!item.manualRevealed) {
+        applyHidden(key, true, "Message hidden until it is checked.");
+      }
+
+      renderPanel();
+
+      const result = await globalThis.WELIVEDIT_HATEBERT.classify(
+        String(item.message || "")
+      );
+
+      const harmful = Boolean(result?.harmful);
+      const harmProbability = Number(result?.harm_probability || 0);
+      const confidence = harmful
+        ? harmProbability
+        : 1 - harmProbability;
+
+      item.classification = {
+        type_of_harm: harmful ? "harm" : "none",
+        content_tone: harmful ? "harmful" : "neutral",
+        secondary_types: [],
+        confidence,
+        harm_probability: harmProbability,
+        evidence_quote: "",
+        reason: "WeLivedIt local HateBERT binary classifier",
+        source: "local_hatebert",
+        threshold: Number(result?.threshold || 0.51),
+      };
+
+      item.classified = true;
+      item.status = "analyzed";
+
+      rememberItem(item, {
+        blocked: false,
+        resolve_status: "local",
+        analyze_status: "classified",
+        classification: item.classification,
+      });
+
+      updateArticleMark(item);
+
+      const keepHidden = isHarmful(item.classification);
+
+      if (!item.manualRevealed) {
+        applyHidden(
+          key,
+          keepHidden,
+          keepHidden ? "Message hidden. It may need care." : ""
+        );
+      }
+
+      console.info("[WeLivedIt local HateBERT]", {
+        clientKey: key,
+        harmful,
+        harmProbability,
+        threshold: item.classification.threshold,
+      });
+
+      return;
+    }
+
+    // ============================================================
+    // LEGACY SERVER MODE
+    // Retained for authenticated/community mode.
+    // ============================================================
     if (!item.resolveDone) {
-      // Re-check community membership immediately before a persistence-capable request.
-      // Thread context can change when navigating between posts, so this check
-      // must happen at send time as well as when the queue is created.
       const storagePermission = getThreadStoragePermission();
+
       if (storagePermission.allowed) {
         item.status = "resolving";
         updateArticleMark(item);
-        if (!item.manualRevealed) applyHidden(key, true, coverLabelForItem(item));
+
+        if (!item.manualRevealed) {
+          applyHidden(key, true, coverLabelForItem(item));
+        }
+
         renderPanel();
-        const resolved = await apiPost("/api/extension/x-comments/resolve", { ...buildPayload([item]), model: state.model });
+
+        const resolved = await apiPost(
+          "/api/extension/x-comments/resolve",
+          {
+            ...buildPayload([item]),
+            model: state.model,
+          }
+        );
+
         applySingleResponseToItem(item, resolved);
         item.resolveDone = true;
+
         if (item.classified) {
-          item.status = String(item.status || "cached").includes("analyzed") ? "analyzed" : "cached";
-          rememberItem(item, { blocked: false, resolve_status: "classified" });
+          item.status = String(item.status || "cached").includes("analyzed")
+            ? "analyzed"
+            : "cached";
+
+          rememberItem(item, {
+            blocked: false,
+            resolve_status: "classified",
+          });
+
           updateArticleMark(item);
           return;
         }
+
         item.status = "missing";
-        rememberItem(item, { blocked: false, resolve_status: "missing", classification: null });
+
+        rememberItem(item, {
+          blocked: false,
+          resolve_status: "missing",
+          classification: null,
+        });
       } else {
-        // Post outside the selected community: validation is performed in the
-        // extension and the persistence path is never called. Continue directly to /analyze
-        // with store_in_db=false so the reply is still classified.
         item.resolveDone = true;
         item.status = "queued_analyze";
-        logCheckStep("extension community validation: direct analysis", {
-          clientKey: item.client_key,
-          postId: state.originalPost?.x_id || null,
-          postOwner: state.originalPost?.author_username || null,
-          reason: storagePermission.reason || "outside_community",
-        });
+
+        logCheckStep(
+          "extension community validation: direct analysis",
+          {
+            clientKey: item.client_key,
+            postId: state.originalPost?.x_id || null,
+            postOwner: state.originalPost?.author_username || null,
+            reason:
+              storagePermission.reason || "outside_community",
+          }
+        );
       }
     }
 
     item.status = "analyzing";
     item.analyzeAttempted = true;
+
     updateArticleMark(item);
-    if (!item.manualRevealed) applyHidden(key, true, coverLabelForItem(item));
+
+    if (!item.manualRevealed) {
+      applyHidden(key, true, coverLabelForItem(item));
+    }
+
     renderPanel();
-    const analyzed = await apiPost("/api/extension/x-comments/analyze", { ...buildPayload([item]), model: state.model, force: false });
+
+    const analyzed = await apiPost(
+      "/api/extension/x-comments/analyze",
+      {
+        ...buildPayload([item]),
+        model: state.model,
+        force: false,
+      }
+    );
+
     applySingleResponseToItem(item, analyzed);
-    if (!item.classified) throw new Error("The backend did not return a classification for this reply.");
+
+    if (!item.classified) {
+      throw new Error(
+        "The backend did not return a classification for this reply."
+      );
+    }
+
     item.status = "analyzed";
-    rememberItem(item, { blocked: false, resolve_status: "missing", analyze_status: "classified" });
+
+    rememberItem(item, {
+      blocked: false,
+      resolve_status: "missing",
+      analyze_status: "classified",
+    });
+
     updateArticleMark(item);
+    ensureFeedbackControls(item);
   } catch (error) {
     item.status = "error";
     item.autoBlocked = true;
     item.lastError = String(error?.message || error);
+
     rememberItem(item, {
       blocked: true,
       failed_stage: item.resolveDone ? "analyze" : "resolve",
       last_error: item.lastError,
     });
-    if (!item.manualRevealed) applyHidden(key, true, coverLabelForItem(item));
+
+    if (!item.manualRevealed) {
+      applyHidden(key, true, coverLabelForItem(item));
+    }
+
     updateArticleMark(item);
+
+    console.error("[WeLivedIt] item processing failed", {
+      clientKey: key,
+      error: item.lastError,
+    });
   } finally {
     state.inFlight.delete(key);
     state.retrying.delete(key);
@@ -1566,18 +3849,50 @@ async function processSingleItem(item, { manual = false } = {}) {
   }
 }
 
+
 function pumpItemQueue() {
-  while (state.activeWorkers < MAX_CONCURRENT_ITEM_JOBS && state.workQueue.length) {
+  const maxWorkers = Math.max(
+    1,
+    Number(globalThis.WELIVEDIT_CONFIG?.ITEM_CONCURRENCY || 3)
+  );
+
+  while (
+    state.activeWorkers < maxWorkers &&
+    state.workQueue.length > 0
+  ) {
     const job = state.workQueue.shift();
-    state.queued.delete(job.key);
-    const item = state.items.get(job.key) || job.item;
-    if (!item || item.classified || (item.autoBlocked && !job.manual)) continue;
+    if (!job) continue;
+
+    const { key, item, manual = false } = job;
+
+    state.queued.delete(key);
+
+    if (
+      !item ||
+      item.classified ||
+      state.inFlight.has(key)
+    ) {
+      continue;
+    }
+
     state.activeWorkers += 1;
-    processSingleItem(item, { manual: job.manual })
+
+    Promise.resolve(
+      processSingleItem(item, { manual })
+    )
+      .catch((error) => {
+        console.error("[WeLivedIt] queue worker failed", {
+          clientKey: key,
+          error: String(error?.message || error),
+        });
+      })
       .finally(() => {
-        state.activeWorkers -= 1;
+        state.activeWorkers = Math.max(
+          0,
+          state.activeWorkers - 1
+        );
+
         pumpItemQueue();
-        renderPanel();
       });
   }
 }
@@ -1801,6 +4116,853 @@ async function sendVisibleToCommunity({ triggeredByLogin = false } = {}) {
 }
 
 
+
+async function submitClassificationFeedback(item, feedback = {}) {
+  if (!item?.classified) {
+    throw new Error("Reply is not classified.");
+  }
+
+  if (!state.authStatus.authenticated) {
+    document.getElementById("welivedit-panel")?.classList.add("open");
+    setStatus("Sign in to send feedback.");
+    updateAuthUi();
+    return { ok: false, needsLogin: true };
+  }
+
+  if (
+    state.processingMode === "local" &&
+    !window.confirm(
+      "This reply was processed locally. Sending feedback will upload this reply and its classification to WeLivedIt. Continue?"
+    )
+  ) {
+    return { ok: false, cancelled: true };
+  }
+
+  const verdict = String(feedback.verdict || "").trim().toLowerCase();
+
+  if (!["right", "wrong", "complicated"].includes(verdict)) {
+    throw new Error("Invalid feedback verdict.");
+  }
+
+  const modelLabel =
+    isHarmful(item.classification)
+      ? "harmful"
+      : "safe";
+
+  const rawScore =
+    item.classification?.score ??
+    item.classification?.confidence ??
+    null;
+
+  const numericScore =
+    rawScore !== null &&
+    rawScore !== "" &&
+    Number.isFinite(Number(rawScore))
+      ? Number(rawScore)
+      : null;
+
+  const rawThreshold =
+    item.classification?.threshold ??
+    state.modelThreshold ??
+    state.threshold ??
+    null;
+
+  const numericThreshold =
+    rawThreshold !== null &&
+    rawThreshold !== "" &&
+    Number.isFinite(Number(rawThreshold))
+      ? Number(rawThreshold)
+      : null;
+
+  const originalPost = state.originalPost || {};
+
+  const payload = {
+    commentId:
+      item.x_id ||
+      item.comment_id ||
+      null,
+
+    postId:
+      originalPost.x_id ||
+      originalPost.post_id ||
+      currentThreadStatusId() ||
+      null,
+
+    replyText:
+      item.message ||
+      null,
+
+    postText:
+      originalPost.message ||
+      originalPost.text ||
+      null,
+
+    modelName:
+      item.classification?.model_name ||
+      item.classification?.model ||
+      state.model ||
+      null,
+
+    modelLabel,
+
+    modelScore: numericScore,
+    modelThreshold: numericThreshold,
+
+    processingMode:
+      state.processingMode ||
+      null,
+
+    testerStrictnessSetting:
+      state.testerStrictnessSetting ||
+      null,
+
+    verdict,
+
+    originalHidden:
+      typeof feedback.originalHidden === "boolean"
+        ? feedback.originalHidden
+        : Boolean(item.hidden && !item.manualRevealed),
+  };
+
+  setStatus("Sending feedback...");
+
+  const response = await runtimeMessage({
+    type: "WELIVEDIT_API_REQUEST",
+    method: "POST",
+    url: `${state.apiBaseUrl}/api/communities/${encodeURIComponent(
+      state.communityId
+    )}/classification-feedback`,
+    body: payload,
+    authRequired: true,
+  });
+
+  if (!response?.ok) {
+    if (response?.auth_required) {
+      state.authStatus = {
+        authenticated: false,
+        email: null,
+      };
+      updateAuthUi();
+    }
+
+    throw new Error(
+      response?.message ||
+      response?.data?.message ||
+      response?.error ||
+      "Feedback could not be saved."
+    );
+  }
+
+  const saved = response?.data?.item || null;
+
+  item.feedbackId = saved?.id || null;
+  item.feedbackVerdict = verdict;
+  item.feedbackReasonChip = saved?.reason_chip || null;
+  item.feedbackNote = saved?.note || null;
+
+  setStatus("Thanks — feedback saved.");
+
+  return {
+    ok: true,
+    item: saved,
+  };
+}
+
+
+async function updateClassificationFeedback(item, patch = {}) {
+  if (!item?.feedbackId) {
+    throw new Error("Feedback has not been created yet.");
+  }
+
+  if (!state.authStatus.authenticated) {
+    setStatus("Sign in to update feedback.");
+    return { ok: false, needsLogin: true };
+  }
+
+  const body = {};
+
+  if ("reasonChip" in patch) {
+    body.reasonChip = patch.reasonChip;
+  }
+
+  if ("note" in patch) {
+    body.note = patch.note;
+  }
+
+  const response = await runtimeMessage({
+    type: "WELIVEDIT_API_REQUEST",
+    method: "PATCH",
+    url: `${state.apiBaseUrl}/api/communities/${encodeURIComponent(
+      state.communityId
+    )}/classification-feedback/${encodeURIComponent(item.feedbackId)}`,
+    body,
+    authRequired: true,
+  });
+
+  if (!response?.ok) {
+    throw new Error(
+      response?.message ||
+      response?.data?.message ||
+      response?.error ||
+      "Feedback details could not be saved."
+    );
+  }
+
+  const saved = response?.data?.item || null;
+
+  item.feedbackReasonChip =
+    saved?.reason_chip ?? item.feedbackReasonChip ?? null;
+
+  item.feedbackNote =
+    saved?.note ?? item.feedbackNote ?? null;
+
+  setStatus("Feedback details saved.");
+
+  return {
+    ok: true,
+    item: saved,
+  };
+}
+
+
+function feedbackReasonOptions() {
+  return [
+    ["supporter_or_calling_out_abuse", "Supporter or calling out abuse"],
+    ["reclaimed_language", "Reclaimed language"],
+    ["sarcasm_or_joke", "Sarcasm or a joke"],
+    ["it_is_abuse_missed", "It IS abuse (missed)"],
+    ["coded_or_dog_whistle", "Coded or dog-whistle"],
+    ["other", "Other"],
+  ];
+}
+
+
+function feedbackControlsHtml(item) {
+  if (!item?.classified) return "";
+
+  if (!item.feedbackId) {
+    return `
+      <div class="welivedit-card-feedback">
+        <button
+          type="button"
+          data-action="feedback"
+        >Give feedback</button>
+      </div>
+    `;
+  }
+
+  let label = "Feedback saved";
+
+  if (item.feedbackVerdict === "right") {
+    label = "✓ Feedback saved";
+  } else if (item.feedbackVerdict === "wrong") {
+    label = "✕ Correction saved";
+  } else if (item.feedbackVerdict === "complicated") {
+    label = "🤷 Feedback saved";
+  }
+
+  return `
+    <div
+      class="welivedit-card-feedback"
+      style="
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:8px;
+        margin-top:7px;
+        font-size:10px;
+      "
+    >
+      <span style="opacity:.78">
+        ${escapeHtml(label)}
+      </span>
+
+      <button
+        type="button"
+        data-action="feedback"
+      >Edit</button>
+    </div>
+  `;
+}
+
+
+function closeFeedbackModal() {
+  const overlay =
+    document.getElementById("welivedit-feedback-overlay");
+
+  if (!overlay) return;
+
+  overlay.classList.remove("is-open");
+  overlay.setAttribute("aria-hidden", "true");
+  delete overlay.dataset.clientKey;
+}
+
+
+function feedbackVerdictLabel(verdict) {
+  if (verdict === "right") return "✓ Right";
+  if (verdict === "wrong") return "✕ Wrong";
+  if (verdict === "complicated") return "🤷 It's complicated";
+  return "";
+}
+
+
+function renderFeedbackModal(item) {
+  const body =
+    document.getElementById("welivedit-feedback-body");
+
+  if (!body || !item) return;
+
+  const author =
+    item.author_username
+      ? `@${item.author_username}`
+      : "Reply";
+
+  const modelHarmful =
+    Boolean(
+      item.classified &&
+      isHarmful(item.classification)
+    );
+
+  const modelLabel =
+    modelHarmful
+      ? "MAY NEED CARE"
+      : "SAFE";
+
+  const replyText =
+    item.message ||
+    "Reply text unavailable.";
+
+  let controls = "";
+
+  if (!item.feedbackId) {
+    controls = `
+      <section class="welivedit-settings-section">
+        <div class="welivedit-settings-section-title">
+          Was the classification right?
+        </div>
+
+        <div
+          class="welivedit-card-actions"
+          style="
+            display:flex;
+            flex-direction:column;
+            gap:7px;
+            margin-top:9px;
+          "
+        >
+          <button
+            type="button"
+            data-feedback-modal-verdict="right"
+          >✓ Right</button>
+
+          <button
+            type="button"
+            data-feedback-modal-verdict="wrong"
+          >✕ Wrong</button>
+
+          <button
+            type="button"
+            data-feedback-modal-verdict="complicated"
+          >🤷 It's complicated</button>
+        </div>
+      </section>
+    `;
+  } else {
+    const verdict =
+      feedbackVerdictLabel(item.feedbackVerdict);
+
+    const detailsAllowed =
+      ["wrong", "complicated"].includes(
+        item.feedbackVerdict
+      );
+
+    const chips = detailsAllowed
+      ? feedbackReasonOptions()
+          .map(([value, label]) => {
+            const selected =
+              item.feedbackReasonChip === value;
+
+            return `
+              <button
+                type="button"
+                data-feedback-modal-reason="${escapeHtml(value)}"
+                aria-pressed="${selected ? "true" : "false"}"
+                style="${
+                  selected
+                    ? "font-weight:700; outline:2px solid rgba(55,120,75,.25);"
+                    : ""
+                }"
+              >
+                ${escapeHtml(label)}
+              </button>
+            `;
+          })
+          .join("")
+      : "";
+
+    controls = `
+      <section class="welivedit-settings-section">
+        <div
+          style="
+            padding:9px 10px;
+            border-radius:8px;
+            background:rgba(65,145,85,.08);
+            margin-bottom:10px;
+          "
+        >
+          <strong>
+            ${escapeHtml(verdict)}
+          </strong>
+
+          <div
+            style="
+              margin-top:3px;
+              font-size:10px;
+              opacity:.72;
+            "
+          >
+            ✓ Feedback saved
+          </div>
+        </div>
+
+        ${
+          detailsAllowed
+            ? `
+              <div class="welivedit-settings-section-title">
+                What made this tricky?
+              </div>
+
+              <p class="welivedit-settings-explanation">
+                Optional. Choose the closest reason.
+              </p>
+
+              <div
+                class="welivedit-card-actions"
+                style="
+                  display:grid;
+                  grid-template-columns:1fr 1fr;
+                  gap:7px;
+                  margin-top:8px;
+                "
+              >
+                ${chips}
+              </div>
+
+              <div
+                style="
+                  margin-top:12px;
+                "
+              >
+                <label
+                  for="welivedit-feedback-note"
+                  style="
+                    display:block;
+                    font-size:10px;
+                    font-weight:700;
+                    margin-bottom:5px;
+                  "
+                >
+                  Optional note
+                </label>
+
+                <textarea
+                  id="welivedit-feedback-note"
+                  maxlength="140"
+                  rows="3"
+                  placeholder="Add context if useful..."
+                  style="
+                    box-sizing:border-box;
+                    width:100%;
+                    resize:none;
+                    border:1px solid #d5ded8;
+                    border-radius:8px;
+                    padding:8px;
+                    font:11px/1.35 Arial,sans-serif;
+                  "
+                >${escapeHtml(item.feedbackNote || "")}</textarea>
+
+                <div
+                  style="
+                    display:flex;
+                    justify-content:flex-end;
+                    margin-top:7px;
+                  "
+                >
+                  <button
+                    type="button"
+                    data-feedback-modal-save-note
+                  >
+                    Save note
+                  </button>
+                </div>
+              </div>
+            `
+            : `
+              <p class="welivedit-settings-explanation">
+                Thanks. Your feedback has been saved.
+              </p>
+            `
+        }
+      </section>
+    `;
+  }
+
+  body.innerHTML = `
+    <section class="welivedit-settings-section">
+      <div
+        style="
+          display:flex;
+          justify-content:space-between;
+          align-items:center;
+          gap:8px;
+          margin-bottom:7px;
+        "
+      >
+        <strong style="font-size:11px">
+          ${escapeHtml(author)}
+        </strong>
+
+        <span
+          style="
+            font-size:9px;
+            font-weight:700;
+            padding:3px 6px;
+            border-radius:999px;
+            background:${
+              modelHarmful
+                ? "rgba(184,82,82,.10)"
+                : "rgba(74,145,92,.12)"
+            };
+          "
+        >
+          ${escapeHtml(modelLabel)}
+        </span>
+      </div>
+
+      <div
+        style="
+          padding:9px;
+          border:1px solid #e1e8e3;
+          border-radius:8px;
+          font-size:11px;
+          line-height:1.4;
+          background:#fff;
+        "
+      >
+        ${escapeHtml(replyText)}
+      </div>
+    </section>
+
+    ${controls}
+  `;
+
+
+  body
+    .querySelectorAll(
+      "[data-feedback-modal-verdict]"
+    )
+    .forEach((button) => {
+      button.addEventListener(
+        "click",
+        async (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+
+          const verdict =
+            button.dataset.feedbackModalVerdict;
+
+          if (!verdict || item.feedbackId) return;
+
+          const buttons =
+            body.querySelectorAll(
+              "[data-feedback-modal-verdict]"
+            );
+
+          buttons.forEach((candidate) => {
+            candidate.disabled = true;
+          });
+
+          try {
+            const result =
+              await submitClassificationFeedback(
+                item,
+                {
+                  verdict,
+                  originalHidden:
+                    Boolean(
+                      item.hidden &&
+                      !item.manualRevealed
+                    ),
+                }
+              );
+
+            if (
+              result?.needsLogin ||
+              result?.cancelled
+            ) {
+              buttons.forEach((candidate) => {
+                candidate.disabled = false;
+              });
+
+              return;
+            }
+
+            renderPanel();
+            renderFeedbackModal(item);
+          } catch (error) {
+            console.error(
+              "[WeLivedIt] modal feedback failed",
+              error
+            );
+
+            setStatus(
+              `Feedback failed: ${String(
+                error?.message || error
+              )}`
+            );
+
+            buttons.forEach((candidate) => {
+              candidate.disabled = false;
+            });
+          }
+        }
+      );
+    });
+
+
+  body
+    .querySelectorAll(
+      "[data-feedback-modal-reason]"
+    )
+    .forEach((button) => {
+      button.addEventListener(
+        "click",
+        async (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+
+          const reasonChip =
+            button.dataset.feedbackModalReason;
+
+          if (
+            !reasonChip ||
+            !item.feedbackId
+          ) {
+            return;
+          }
+
+          try {
+            button.disabled = true;
+
+            const result =
+              await updateClassificationFeedback(
+                item,
+                { reasonChip }
+              );
+
+            if (result?.ok) {
+              renderPanel();
+              renderFeedbackModal(item);
+            }
+          } catch (error) {
+            console.error(
+              "[WeLivedIt] modal feedback reason failed",
+              error
+            );
+
+            setStatus(
+              `Feedback update failed: ${String(
+                error?.message || error
+              )}`
+            );
+
+            button.disabled = false;
+          }
+        }
+      );
+    });
+
+
+  body
+    .querySelector(
+      "[data-feedback-modal-save-note]"
+    )
+    ?.addEventListener(
+      "click",
+      async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const textarea =
+          document.getElementById(
+            "welivedit-feedback-note"
+          );
+
+        const note =
+          String(textarea?.value || "")
+            .trim()
+            .slice(0, 140);
+
+        try {
+          event.currentTarget.disabled = true;
+
+          const result =
+            await updateClassificationFeedback(
+              item,
+              { note }
+            );
+
+          if (result?.ok) {
+            renderPanel();
+            renderFeedbackModal(item);
+          }
+        } catch (error) {
+          console.error(
+            "[WeLivedIt] modal feedback note failed",
+            error
+          );
+
+          setStatus(
+            `Feedback update failed: ${String(
+              error?.message || error
+            )}`
+          );
+
+          event.currentTarget.disabled = false;
+        }
+      }
+    );
+}
+
+
+function ensureFeedbackModal() {
+  const panel =
+    document.getElementById("welivedit-panel");
+
+  if (!panel) return null;
+
+  let overlay =
+    document.getElementById(
+      "welivedit-feedback-overlay"
+    );
+
+  if (overlay) return overlay;
+
+  overlay = document.createElement("div");
+  overlay.id = "welivedit-feedback-overlay";
+  overlay.setAttribute("aria-hidden", "true");
+
+  overlay.style.cssText = `
+    position:absolute;
+    inset:0;
+    z-index:10040;
+    display:none;
+    background:rgba(238,246,240,.98);
+  `;
+
+  overlay.innerHTML = `
+    <div
+      id="welivedit-feedback-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="welivedit-feedback-title"
+      style="
+        box-sizing:border-box;
+        width:100%;
+        height:100%;
+        display:flex;
+        flex-direction:column;
+        background:#eef6f0;
+      "
+    >
+      <div class="welivedit-settings-header">
+        <div>
+          <h3 id="welivedit-feedback-title">
+            Feedback
+          </h3>
+
+          <small>
+            Help improve how WeLivedIt handles grey areas.
+          </small>
+        </div>
+
+        <button
+          id="welivedit-feedback-close"
+          type="button"
+          aria-label="Close feedback"
+        >×</button>
+      </div>
+
+      <div
+        id="welivedit-feedback-body"
+        style="
+          overflow:auto;
+          flex:1;
+          padding:10px;
+        "
+      ></div>
+    </div>
+  `;
+
+  panel.appendChild(overlay);
+
+  const style = document.createElement("style");
+  style.textContent = `
+    #welivedit-feedback-overlay.is-open {
+      display:block !important;
+    }
+
+    #welivedit-feedback-overlay button {
+      cursor:pointer;
+    }
+
+    #welivedit-feedback-overlay
+      [data-feedback-modal-reason][aria-pressed="true"] {
+      background:#3f8f55 !important;
+      color:white !important;
+    }
+  `;
+
+  document.head.appendChild(style);
+
+  overlay.addEventListener(
+    "click",
+    (event) => {
+      if (event.target === overlay) {
+        closeFeedbackModal();
+      }
+    }
+  );
+
+  document
+    .getElementById("welivedit-feedback-close")
+    ?.addEventListener(
+      "click",
+      closeFeedbackModal
+    );
+
+  return overlay;
+}
+
+
+function openFeedbackModal(item) {
+  if (!item) return;
+
+  const overlay =
+    ensureFeedbackModal();
+
+  if (!overlay) return;
+
+  overlay.dataset.clientKey =
+    item.client_key;
+
+  overlay.classList.add("is-open");
+  overlay.setAttribute("aria-hidden", "false");
+
+  renderFeedbackModal(item);
+}
+
+
 async function apiPost(path, body) {
   // Client-side persistence guard. /resolve is never sent when the original
   // post owner is outside the selected monitored community. This is business logic in the extension; the
@@ -1892,21 +5054,168 @@ function revealOnlyWhenAllVisibleClassified() {
   const items = [...state.items.values()];
   if (!items.length) return;
   for (const item of items) {
+    if (item.manualHidden) {
+      applyHidden(
+        item.client_key,
+        true,
+        item.classified && isHarmful(item.classification)
+          ? "Message hidden. It may need care."
+          : "Message hidden.",
+        { force: true }
+      );
+      continue;
+    }
     if (item.manualRevealed) continue;
     if (!item.classified) {
       applyHidden(item.client_key, true, "Message hidden until it is checked.");
       continue;
     }
-    const keepHidden = isHarmful(item.classification);
-    applyHidden(item.client_key, keepHidden, keepHidden ? "Message hidden. It may need care." : "");
+    const keepHidden = shouldProtectItem(item);
+    applyHidden(
+      item.client_key,
+      keepHidden,
+      keepHidden ? protectionLabelForItem(item) : ""
+    );
+  }
+}
+
+
+function ensureFeedbackControls(item) {
+  // Feedback now lives in the WeLivedIt sidebar cards.
+  // Keep this function as a no-op while older call sites are removed gradually.
+  return;
+
+  const article = item?.element || state.domByKey.get(item?.client_key);
+  if (!article || !item?.classified) return;
+
+  let box = article.querySelector(
+    `.welivedit-feedback[data-client-key="${CSS.escape(item.client_key)}"]`
+  );
+
+  if (!box) {
+    box = document.createElement("div");
+    box.className = "welivedit-feedback";
+    box.dataset.clientKey = item.client_key;
+
+    box.style.cssText = `
+      display:flex;
+      gap:6px;
+      align-items:center;
+      flex-wrap:wrap;
+      margin:7px 0 4px;
+      font:11px Arial,sans-serif;
+    `;
+
+    box.innerHTML = `
+      <span style="opacity:.72">Was this right?</span>
+      <button type="button" data-feedback="agreed">👍 Agree</button>
+      <button type="button" data-feedback="corrected">✏️ Incorrect</button>
+      <button type="button" data-feedback="needs_discussion">💬 Discuss</button>
+    `;
+
+    box.querySelectorAll("button").forEach((button) => {
+      button.style.cssText = `
+        border:1px solid rgba(0,0,0,.16);
+        background:transparent;
+        border-radius:7px;
+        padding:3px 6px;
+        cursor:pointer;
+        font:11px Arial,sans-serif;
+      `;
+
+      button.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        event.preventDefault();
+
+        const status = button.dataset.feedback;
+
+        const reviewerTypeOfHarm =
+          status === "corrected"
+            ? (
+                isHarmful(item.classification)
+                  ? "none"
+                  : "harm"
+              )
+            : null;
+
+        try {
+          box.querySelectorAll("button").forEach((b) => {
+            b.disabled = true;
+          });
+
+          const result = await submitClassificationFeedback(item, {
+            status,
+            reviewerTypeOfHarm,
+            reason:
+              status === "agreed"
+                ? "User agreed with the classification."
+                : status === "corrected"
+                  ? "User marked the binary classification as incorrect."
+                  : "User marked this classification for discussion.",
+          });
+
+          if (result?.needsLogin || result?.cancelled) {
+            box.querySelectorAll("button").forEach((b) => {
+              b.disabled = false;
+            });
+            return;
+          }
+
+          box.innerHTML = `<span style="opacity:.8">✓ Feedback sent: ${escapeHtml(status.replaceAll("_", " "))}</span>`;
+        } catch (error) {
+          console.error("[WeLivedIt] feedback failed", error);
+
+          setStatus(
+            `Feedback failed: ${String(error?.message || error)}`
+          );
+
+          box.querySelectorAll("button").forEach((b) => {
+            b.disabled = false;
+          });
+        }
+      });
+    });
+
+    const textEl = article.querySelector('[data-testid="tweetText"]');
+
+    if (textEl?.parentElement) {
+      textEl.parentElement.appendChild(box);
+    } else {
+      article.appendChild(box);
+    }
+  }
+
+  if (item.feedbackStatus) {
+    box.innerHTML = `<span style="opacity:.8">✓ Feedback sent: ${escapeHtml(
+      item.feedbackStatus.replaceAll("_", " ")
+    )}</span>`;
   }
 }
 
 function redactionTargets(article) {
   if (!article) return [];
-  return [...article.children].filter((el) => {
-    return !el.classList?.contains("welivedit-cover") && !el.classList?.contains("welivedit-mark");
-  });
+
+  const targets = [];
+
+  const textEl = article.querySelector('[data-testid="tweetText"]');
+  if (textEl) targets.push(textEl);
+
+  if (state.hideMedia) {
+    const mediaSelectors = [
+      '[data-testid="tweetPhoto"]',
+      '[data-testid="videoPlayer"]',
+      '[data-testid="card.wrapper"]',
+      'video'
+    ];
+
+    for (const selector of mediaSelectors) {
+      article.querySelectorAll(selector).forEach((el) => {
+        if (!targets.includes(el)) targets.push(el);
+      });
+    }
+  }
+
+  return targets;
 }
 
 function applyRedactionShell(article) {
@@ -2004,6 +5313,10 @@ function updateArticleMark(item) {
 
 function ensureCover(article, clientKey) {
   if (!article || !clientKey) return null;
+
+  const textEl = article.querySelector('[data-testid="tweetText"]');
+  if (!textEl) return null;
+
   let cover = state.coverByKey.get(clientKey);
   if (!cover) {
     cover = document.createElement("div");
@@ -2016,8 +5329,13 @@ function ensureCover(article, clientKey) {
     state.coverByKey.set(clientKey, cover);
   }
 
-  article.style.position = article.style.position || "relative";
-  if (cover.parentElement !== article) article.appendChild(cover);
+  const parent = textEl.parentElement;
+  if (!parent) return null;
+
+  if (cover.parentElement !== parent || cover.previousElementSibling !== textEl) {
+    textEl.insertAdjacentElement("afterend", cover);
+  }
+
   positionCover(article, cover);
   return cover;
 }
@@ -2038,21 +5356,35 @@ function showRehideControl(article, cover, clientKey) {
   if (cover.dataset.weliveditRehideFor === clientKey && cover.querySelector("button")) return;
 
   cover.dataset.weliveditRehideFor = clientKey;
-  cover.innerHTML = `<button type="button" aria-label="Hide this reply again on X">Hide again</button>`;
+
+  const item = state.items.get(clientKey);
+  const wasProtected =
+    Boolean(
+      item &&
+      shouldProtectItem(item)
+    );
+
+  const hideLabel =
+    wasProtected ? "Re-hide" : "Hide";
+
+  cover.innerHTML =
+    `<button type="button" aria-label="${hideLabel} this reply on X">${hideLabel}</button>`;
   cover.querySelector("button")?.addEventListener("click", (event) => {
     event.stopPropagation();
     event.preventDefault();
     const item = state.items.get(clientKey);
     if (!item) return;
+    item.manualHidden = true;
     item.manualRevealed = false;
     applyHidden(
       clientKey,
       true,
-      item.classified && isHarmful(item.classification)
-        ? "Message hidden. It may need care."
+      shouldProtectItem(item)
+        ? protectionLabelForItem(item)
         : "Message hidden.",
       { force: true }
     );
+    rememberItem(item, { manual_hidden: true });
     setStatus("Reply hidden again on X.");
     renderPanel();
   });
@@ -2097,8 +5429,6 @@ function applyHidden(clientKey, hidden, label = "Message hidden until it is chec
     item.manualRevealed = false;
     cover.classList.remove("is-rehide");
     delete cover.dataset.weliveditRehideFor;
-    article.classList.add("welivedit-hard-hidden");
-    article.setAttribute("data-welivedit-hidden", "true");
     applyRedactionShell(article);
     cover.setAttribute("aria-hidden", "false");
     cover.innerHTML = `<div>${escapeHtml(label || "Message hidden.")}</div><button type="button">Show message</button>`;
@@ -2106,14 +5436,14 @@ function applyHidden(clientKey, hidden, label = "Message hidden until it is chec
     cover.querySelector("button")?.addEventListener("click", (event) => {
       event.stopPropagation();
       event.preventDefault();
+      item.manualHidden = false;
       item.manualRevealed = true;
+      rememberItem(item, { manual_hidden: false });
       applyHidden(clientKey, false, "", { manual: true });
       setStatus("Reply shown on X. Use Hide again to conceal it when finished.");
       renderPanel();
     }, { once: true });
   } else {
-    article.classList.remove("welivedit-hard-hidden");
-    article.removeAttribute("data-welivedit-hidden");
     restoreRedactionShell(article);
 
     if (options.manual || item.manualRevealed) {
@@ -2130,11 +5460,15 @@ function toggleVisibility(clientKey) {
   const item = state.items.get(clientKey);
   if (!item) return;
   if (item.hidden) {
+    item.manualHidden = false;
     item.manualRevealed = true;
+    rememberItem(item, { manual_hidden: false });
     applyHidden(clientKey, false, "", { manual: true });
   } else {
+    item.manualHidden = true;
     item.manualRevealed = false;
     applyHidden(clientKey, true, item.classified && isHarmful(item.classification) ? "Message hidden. It may need care." : "Message hidden.", { force: true });
+    rememberItem(item, { manual_hidden: true });
   }
   renderPanel();
 }
@@ -2167,99 +5501,409 @@ function temporarilyHighlightArticle(article) {
   article.classList.remove("welivedit-focus-highlight");
   void article.offsetWidth;
   article.classList.add("welivedit-focus-highlight");
-  window.setTimeout(() => article.classList.remove("welivedit-focus-highlight"), 2600);
+  window.setTimeout(() => article.classList.remove("welivedit-focus-highlight"), 5000);
 }
 
-function focusItemOnX(clientKey) {
+async function focusItemOnX(clientKey) {
   const item = state.items.get(clientKey);
   if (!item) return;
 
-  item.manualRevealed = true;
-  applyHidden(clientKey, false, "", { manual: true });
-  const article = exactArticleForItem(item);
+  // Fast path: use the DOM node we already know.
+  // This makes normal focus react immediately on the first click.
+  let article =
+    item.element?.isConnected
+      ? item.element
+      : state.domByKey.get(item.client_key)?.isConnected
+        ? state.domByKey.get(item.client_key)
+        : exactArticleForItem(item);
+
+  // Only search through the thread if X really virtualized the reply away.
+  if (!article) {
+    const originalY = window.scrollY;
+
+    const connectedItems = [...state.items.values()]
+      .filter((candidate) => exactArticleForItem(candidate))
+      .filter((candidate) => Number.isFinite(candidate.dom_order));
+
+    let direction = 1;
+
+    if (Number.isFinite(item.dom_order) && connectedItems.length) {
+      const orders = connectedItems.map((candidate) => candidate.dom_order);
+      const minOrder = Math.min(...orders);
+      const maxOrder = Math.max(...orders);
+
+      if (item.dom_order < minOrder) direction = -1;
+      else if (item.dom_order > maxOrder) direction = 1;
+    }
+
+    const step = Math.max(350, Math.floor(window.innerHeight * 0.72));
+
+    for (let i = 0; i < 24; i += 1) {
+      window.scrollBy({
+        top: direction * step,
+        left: 0,
+        behavior: "auto",
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 120));
+
+      // Let X recycle/render articles, then rescan their identities.
+      scanVisibleReplies({ render: false, hide: true });
+
+      article = exactArticleForItem(item);
+      if (article) break;
+
+      // Hit a boundary: try the other direction.
+      const atTop = window.scrollY <= 5;
+      const atBottom =
+        window.innerHeight + window.scrollY >=
+        document.documentElement.scrollHeight - 5;
+
+      if ((direction < 0 && atTop) || (direction > 0 && atBottom)) {
+        direction *= -1;
+
+        window.scrollTo({
+          top: originalY,
+          left: 0,
+          behavior: "auto",
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
+    }
+  }
 
   if (article) {
-    document.getElementById("welivedit-panel")?.classList.remove("open");
-    article.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+    article.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+      inline: "nearest",
+    });
+
     temporarilyHighlightArticle(article);
-    window.setTimeout(() => temporarilyHighlightArticle(article), 450);
-    setStatus(`Focused ${item.author_username ? `@${item.author_username}` : "reply"} on X.`);
-  } else if (item.url) {
-    const opened = window.open(item.url, "_blank", "noopener,noreferrer");
-    if (opened) {
-      setStatus("The reply was no longer loaded in this scroll, so its exact X URL was opened in a new tab.");
-    } else {
-      setStatus("The reply is no longer loaded. Allow pop-ups to open its exact X URL.");
-    }
+
+    window.setTimeout(
+      () => temporarilyHighlightArticle(article),
+      450
+    );
+
+    setStatus(
+      `Focused ${item.author_username ? `@${item.author_username}` : "reply"} on X.`
+    );
   } else {
-    setStatus("This reply is no longer loaded and has no exact X URL available.");
+    setStatus(
+      "Could not find this reply in the currently loaded X conversation."
+    );
   }
+
   renderPanel();
 }
-
 function renderPanel() {
+  updateCompactPanelSummary();
+
   updateAuthUi();
   renderThreadAccount();
   updateSendPermissionsUi();
+
   const summary = document.getElementById("welivedit-summary");
   const content = document.getElementById("welivedit-content");
+
   if (!summary || !content) return;
-  const items = [...state.items.values()].sort((a, b) => (a.dom_order ?? Number.MAX_SAFE_INTEGER) - (b.dom_order ?? Number.MAX_SAFE_INTEGER));
+
+  const items = [...state.items.values()].sort(
+    (a, b) =>
+      (a.dom_order ?? Number.MAX_SAFE_INTEGER) -
+      (b.dom_order ?? Number.MAX_SAFE_INTEGER)
+  );
+
   renderCommentClimate(items);
-  const active = items.filter((x) => state.inFlight.has(x.client_key)).length;
-  const queuedCount = items.filter((x) => state.queued.has(x.client_key)).length;
-  const waiting = items.filter((x) => !x.classified && x.status !== "error" && !state.inFlight.has(x.client_key) && !state.queued.has(x.client_key)).length;
-  const errors = items.filter((x) => x.status === "error").length;
-  const harmful = items.filter((x) => x.classified && isHarmful(x.classification)).length;
-  const safe = items.filter((x) => x.classified && !isHarmful(x.classification)).length;
-  summary.textContent = `${items.length} replies · ${safe} safe · ${harmful} hidden · ${active} active · ${queuedCount} queued${errors ? ` · ${errors} failed` : ""}${waiting ? ` · ${waiting} waiting` : ""}`;
+
+  const active = items.filter(
+    (x) => state.inFlight.has(x.client_key)
+  ).length;
+
+  const queuedCount = items.filter(
+    (x) => state.queued.has(x.client_key)
+  ).length;
+
+  const waiting = items.filter(
+    (x) =>
+      !x.classified &&
+      x.status !== "error" &&
+      !state.inFlight.has(x.client_key) &&
+      !state.queued.has(x.client_key)
+  ).length;
+
+  const errors = items.filter(
+    (x) => x.status === "error"
+  ).length;
+
+  const hidden = items.filter(
+    (x) =>
+      x.classified &&
+      shouldProtectItem(x)
+  ).length;
+
+  const safe = items.filter(
+    (x) =>
+      x.classified &&
+      !shouldProtectItem(x)
+  ).length;
+
+  summary.textContent =
+    `${items.length} replies · ${safe} safe · ${hidden} hidden · ` +
+    `${active} active · ${queuedCount} queued` +
+    `${errors ? ` · ${errors} failed` : ""}` +
+    `${waiting ? ` · ${waiting} waiting` : ""}`;
+
   content.innerHTML = "";
 
   if (!items.length) {
-    content.innerHTML = `<div class="welivedit-empty">Open an X post with replies. New replies will appear here in feed order.</div>`;
+    content.innerHTML =
+      `<div class="welivedit-empty">` +
+      `Open an X post with replies. New replies will appear here in feed order.` +
+      `</div>`;
+
     return;
   }
 
   for (const item of items) {
     const card = document.createElement("div");
-    card.className = "welivedit-card";
+
     const status = statusDisplay(item);
-    const author = item.author_username ? `@${item.author_username}` : "Reply";
-    let body = "";
-    if (item.classified && !isHarmful(item.classification)) {
-      body = `<div class="welivedit-card-text">${escapeHtml(item.message)}</div>`;
+    const author =
+      item.author_username
+        ? `@${item.author_username}`
+        : "Reply";
+
+    const matchedRule = blockedWordMatch(item);
+
+    const modelHarmful =
+      Boolean(
+        item.classified &&
+        isHarmful(item.classification)
+      );
+
+    const protectedByRule =
+      Boolean(matchedRule);
+
+    const protectedItem =
+      protectedByRule || modelHarmful;
+
+    let toneClass = "is-pending";
+
+    if (item.status === "error") {
+      toneClass = "is-error";
+    } else if (protectedByRule) {
+      toneClass = "is-user-rule";
+    } else if (modelHarmful) {
+      toneClass = "is-harmful";
     } else if (item.classified) {
-      body = `<div class="welivedit-card-placeholder">Hidden on X because it may need care.</div>`;
-    } else if (item.status === "error") {
-      body = `<div class="welivedit-card-placeholder">${escapeHtml(item.lastError || "This reply could not be checked.")}</div>`;
-    } else {
-      body = `<div class="welivedit-card-placeholder">${escapeHtml(coverLabelForItem(item))}</div>`;
+      toneClass = "is-safe";
     }
 
-    const isManualRetry = state.retrying.has(item.client_key);
-    const retryBusy = isManualRetry || state.inFlight.has(item.client_key) || state.queued.has(item.client_key);
-    const focusLabel = item.hidden ? "Show & focus on X" : "Focus on X";
-    const retryButton = (item.status === "error" || isManualRetry)
-      ? `<button data-action="retry" ${retryBusy ? "disabled aria-disabled=\"true\"" : ""}>${retryBusy ? "Retrying…" : "Retry"}</button>`
-      : "";
-    const hideButton = item.classified && !item.hidden
-      ? `<button data-action="toggle">${item.manualRevealed ? "Hide again on X" : "Hide on X"}</button>`
-      : "";
-    const action = `<div class="welivedit-card-actions">${retryButton}<button data-action="focus">${focusLabel}</button>${hideButton}</div>`;
+    card.className =
+      `welivedit-card ${toneClass}`;
+
+    let body = "";
+
+    if (protectedByRule) {
+      body = `
+        <div class="welivedit-card-placeholder welivedit-card-reason is-user-rule">
+          <strong>Hidden by your protection rule</strong>
+          <span>Matched: “${escapeHtml(String(matchedRule))}”</span>
+        </div>
+      `;
+    } else if (modelHarmful) {
+      body = `
+        <div class="welivedit-card-placeholder welivedit-card-reason is-harmful">
+          <strong>Hidden because it may need care</strong>
+          <span>The classifier flagged this reply.</span>
+        </div>
+      `;
+    } else if (item.classified) {
+      body =
+        `<div class="welivedit-card-text">` +
+        `${escapeHtml(item.message)}` +
+        `</div>`;
+    } else if (item.status === "error") {
+      body =
+        `<div class="welivedit-card-placeholder">` +
+        `${escapeHtml(
+          item.lastError ||
+          "This reply could not be checked."
+        )}` +
+        `</div>`;
+    } else {
+      body =
+        `<div class="welivedit-card-placeholder">` +
+        `${escapeHtml(coverLabelForItem(item))}` +
+        `</div>`;
+    }
+
+    const isManualRetry =
+      state.retrying.has(item.client_key);
+
+    const retryBusy =
+      isManualRetry ||
+      state.inFlight.has(item.client_key) ||
+      state.queued.has(item.client_key);
+
+    const retryButton =
+      (item.status === "error" || isManualRetry)
+        ? `<button data-action="retry" ${
+            retryBusy
+              ? 'disabled aria-disabled="true"'
+              : ""
+          }>${
+            retryBusy ? "Retrying…" : "Retry"
+          }</button>`
+        : "";
+
+    // Focus NEVER changes visibility.
+    const focusButton =
+      `<button data-action="focus">Focus on X</button>`;
+
+    let visibilityButton = "";
+
+    if (item.classified) {
+      if (item.hidden) {
+        if (
+          modelHarmful &&
+          !protectedByRule &&
+          !item.manualHidden
+        ) {
+          visibilityButton =
+            `<button data-action="toggle" data-feedback-wrong="show">Show — it's fine</button>`;
+        } else {
+          visibilityButton =
+            `<button data-action="toggle">Show on X</button>`;
+        }
+      } else if (
+        item.manualRevealed &&
+        protectedItem
+      ) {
+        visibilityButton =
+          `<button data-action="toggle">Re-hide on X</button>`;
+      } else if (
+        !modelHarmful &&
+        !item.manualRevealed
+      ) {
+        visibilityButton =
+          `<button data-action="toggle" data-feedback-wrong="hide">Hide this</button>`;
+      } else {
+        visibilityButton =
+          `<button data-action="toggle">Hide on X</button>`;
+      }
+    }
+
+    const action = `
+      <div class="welivedit-card-actions">
+        ${retryButton}
+        ${focusButton}
+        ${visibilityButton}
+      </div>
+    `;
 
     card.innerHTML = `
       <div class="welivedit-card-head">
-        <span class="welivedit-card-author">${escapeHtml(author)}</span>
-        <span class="welivedit-badge ${status.className}">${escapeHtml(status.text)}</span>
+        <span class="welivedit-card-author">
+          ${escapeHtml(author)}
+        </span>
+
+        <span class="welivedit-badge ${status.className}">
+          ${escapeHtml(status.text)}
+        </span>
       </div>
+
       ${body}
-      ${action}`;
-    card.querySelector('[data-action="retry"]')?.addEventListener("click", () => retryItem(item.client_key));
-    card.querySelector('[data-action="focus"]')?.addEventListener("click", () => focusItemOnX(item.client_key));
-    card.querySelector('[data-action="toggle"]')?.addEventListener("click", () => toggleVisibility(item.client_key));
+      ${action}
+      ${feedbackControlsHtml(item)}
+    `;
+
+    card
+      .querySelector('[data-action="retry"]')
+      ?.addEventListener(
+        "click",
+        () => retryItem(item.client_key)
+      );
+
+    card
+      .querySelector('[data-action="focus"]')
+      ?.addEventListener(
+        "click",
+        () => focusItemOnX(item.client_key)
+      );
+
+    card
+      .querySelector('[data-action="toggle"]')
+      ?.addEventListener(
+        "click",
+        async (event) => {
+          const button = event.currentTarget;
+
+          const implicitWrong =
+            button?.dataset?.feedbackWrong || null;
+
+          const originalHidden =
+            Boolean(item.hidden && !item.manualRevealed);
+
+          // Visibility controls always remain usable, even when signed out.
+          toggleVisibility(item.client_key);
+
+          // Personal blocked-word rules never become model feedback.
+          // Re-hide also never creates a second feedback event.
+          if (
+            implicitWrong &&
+            !protectedByRule &&
+            !item.feedbackId
+          ) {
+            try {
+              const result =
+                await submitClassificationFeedback(
+                  item,
+                  {
+                    verdict: "wrong",
+                    originalHidden,
+                  }
+                );
+
+              if (result?.ok) {
+                renderPanel();
+              }
+            } catch (error) {
+              console.error(
+                "[WeLivedIt] implicit feedback failed",
+                error
+              );
+
+              setStatus(
+                `Feedback failed: ${String(
+                  error?.message || error
+                )}`
+              );
+            }
+          }
+        }
+      );
+
+
+    card
+      .querySelector('[data-action="feedback"]')
+      ?.addEventListener(
+        "click",
+        (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+
+          openFeedbackModal(item);
+        }
+      );
+
+
     content.appendChild(card);
   }
-} 
+}
 
 function pageKey() {
   // Ignore query/hash churn. Only a different /status/:id should reset a thread.
@@ -2474,9 +6118,9 @@ function renderCommentClimate(items) {
   container.innerHTML = `
     <div class="welivedit-climate-title">Comment climate</div>
     <div class="welivedit-climate-grid">
-      <div class="welivedit-climate-label">Before protection</div>
+      <div class="welivedit-climate-label">Original thread safety</div>
       ${climateResultHtml(climate.before, climate.safePercent)}
-      <div class="welivedit-climate-label">Visible now</div>
+      <div class="welivedit-climate-label">Currently visible safety</div>
       ${climateResultHtml(climate.after, climate.visibleSafePercent)}
     </div>
     ${impact}
