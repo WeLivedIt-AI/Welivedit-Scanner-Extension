@@ -4346,6 +4346,10 @@ function feedbackControlsHtml(item) {
         <button
           type="button"
           data-action="feedback"
+          style="
+            font-size:9px;
+            padding:4px 7px;
+          "
         >Give feedback</button>
       </div>
     `;
@@ -4373,13 +4377,28 @@ function feedbackControlsHtml(item) {
         font-size:10px;
       "
     >
-      <span style="opacity:.78">
+      <span
+        style="
+          display:inline-flex;
+          align-items:center;
+          padding:4px 7px;
+          border-radius:999px;
+          background:rgba(65,145,85,.10);
+          font-size:10px;
+          font-weight:700;
+          opacity:.95;
+        "
+      >
         ${escapeHtml(label)}
       </span>
 
       <button
         type="button"
         data-action="feedback"
+        style="
+          font-size:9px;
+          padding:3px 6px;
+        "
       >Edit</button>
     </div>
   `;
